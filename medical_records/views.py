@@ -3,6 +3,7 @@ EMR endpoints (Feature 5). All additive and independent of booking, queue,
 attendance, waitlist, and duration-prediction logic.
 """
 
+from django.contrib.auth import get_user_model
 from django.db.models import Count, Q
 from django.shortcuts import get_object_or_404
 from rest_framework import permissions, status
@@ -38,6 +39,8 @@ from .serializers import (
     PrescriptionWriteSerializer,
 )
 from .services import MedicalTimelineService
+
+User = get_user_model()
 
 
 def _record_for(user) -> PatientRecord:
@@ -220,6 +223,85 @@ class TimelineView(APIView):
             events = MedicalTimelineService.build_for_visit(visit)
         else:
             events = MedicalTimelineService.build_for_patient(request.user)
+        return Response({"timeline": events})
+
+
+class PatientRecordDetailView(APIView):
+    """GET /api/records/patients/{patient_id}/ — a specific patient's health
+    record, for staff. Requires "emr.view".
+
+    Reuses PatientRecordSerializer and the existing _record_for() helper, so it
+    behaves exactly like /api/records/me/ but for an explicit patient.
+    """
+
+    permission_classes = [PermissionRequired]
+    permission_code = "emr.view"
+
+    def get(self, request, patient_id):
+        patient = get_object_or_404(User, pk=patient_id)
+        record = _record_for(patient)
+        return Response(
+            PatientRecordSerializer(record, context={"request": request}).data
+        )
+
+
+class PatientVisitListView(APIView):
+    """GET /api/records/patients/{patient_id}/visits/ — a specific patient's
+    visit history, for staff. Requires "emr.view".
+
+    Mirrors VisitListView's search params, scoped to the target patient.
+    """
+
+    permission_classes = [PermissionRequired]
+    permission_code = "emr.view"
+
+    def get(self, request, patient_id):
+        patient = get_object_or_404(User, pk=patient_id)
+        qs = (
+            MedicalVisit.objects.filter(patient=patient)
+            .select_related("appointment", "doctor")
+            .prefetch_related("prescriptions", "reports", "vitals")
+        )
+        p = request.query_params
+        if p.get("diagnosis"):
+            qs = qs.filter(diagnosis__icontains=p["diagnosis"])
+        if p.get("medicine"):
+            qs = qs.filter(prescriptions__medicine__icontains=p["medicine"])
+        if p.get("doctor"):
+            qs = qs.filter(doctor__name__icontains=p["doctor"])
+        if p.get("date"):
+            qs = qs.filter(appointment__date=p["date"])
+        if p.get("q"):
+            term = p["q"]
+            qs = qs.filter(
+                Q(diagnosis__icontains=term)
+                | Q(chief_complaint__icontains=term)
+                | Q(doctor__name__icontains=term)
+                | Q(prescriptions__medicine__icontains=term)
+            )
+        qs = qs.distinct()
+        return Response(
+            {
+                "results": MedicalVisitSerializer(
+                    qs, many=True, context={"request": request}
+                ).data
+            }
+        )
+
+
+class PatientTimelineView(APIView):
+    """GET /api/records/patients/{patient_id}/timeline/ — a specific patient's
+    clinical timeline, for staff. Requires "emr.view".
+
+    Reuses MedicalTimelineService.build_for_patient().
+    """
+
+    permission_classes = [PermissionRequired]
+    permission_code = "emr.view"
+
+    def get(self, request, patient_id):
+        patient = get_object_or_404(User, pk=patient_id)
+        events = MedicalTimelineService.build_for_patient(patient)
         return Response({"timeline": events})
 
 

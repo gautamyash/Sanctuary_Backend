@@ -3,7 +3,10 @@ from django.urls import path
 from .views import (
     AllergyCreateView,
     MedicationCreateView,
+    PatientRecordDetailView,
     PatientRecordMeView,
+    PatientTimelineView,
+    PatientVisitListView,
     RecordsAnalyticsView,
     TimelineView,
     VisitDetailView,
@@ -15,6 +18,21 @@ from .views import (
 
 urlpatterns = [
     path("records/me/", PatientRecordMeView.as_view(), name="record-me"),
+    path(
+        "records/patients/<int:patient_id>/",
+        PatientRecordDetailView.as_view(),
+        name="record-patient-detail",
+    ),
+    path(
+        "records/patients/<int:patient_id>/visits/",
+        PatientVisitListView.as_view(),
+        name="record-patient-visits",
+    ),
+    path(
+        "records/patients/<int:patient_id>/timeline/",
+        PatientTimelineView.as_view(),
+        name="record-patient-timeline",
+    ),
     path("records/visits/", VisitListView.as_view(), name="record-visits"),
     path(
         "records/visits/<int:pk>/",

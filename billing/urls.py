@@ -2,6 +2,7 @@ from django.urls import path
 
 from .views import (
     AddItemView,
+    AdminInvoiceListView,
     ApplyCouponView,
     BillingAnalyticsView,
     InvoiceDetailView,
@@ -16,6 +17,7 @@ urlpatterns = [
     path("billing/my-invoices/", MyInvoicesView.as_view(), name="my-invoices"),
     path("billing/services/", ServiceCatalogView.as_view(), name="billing-services"),
     path("billing/analytics/", BillingAnalyticsView.as_view(), name="billing-analytics"),
+    path("billing/invoices/", AdminInvoiceListView.as_view(), name="invoice-list"),
     path("billing/invoices/<int:pk>/", InvoiceDetailView.as_view(), name="invoice-detail"),
     path("billing/invoices/<int:pk>/items/", AddItemView.as_view(), name="invoice-items"),
     path(

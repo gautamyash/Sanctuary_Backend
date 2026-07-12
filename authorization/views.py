@@ -9,13 +9,17 @@ existing Features 1-6 endpoint.
 from django.contrib.auth import get_user_model
 from django.core.exceptions import PermissionDenied as DjangoPermissionDenied
 from django.db import transaction
+from django.db.models import Q
 from django.shortcuts import get_object_or_404
 from rest_framework import generics, status
 from rest_framework.exceptions import PermissionDenied as DRFPermissionDenied
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from accounts.serializers import UserSerializer
+
 from .models import Permission, Role, UserRole
+from .permissions import PermissionRequired
 from .serializers import (
     AssignRoleSerializer,
     PermissionSerializer,
@@ -98,6 +102,53 @@ class AssignRoleView(APIView):
 
         return Response(
             UserRoleSerializer(user_role).data, status=status.HTTP_201_CREATED
+        )
+
+
+class UserListView(APIView):
+    """GET /api/auth/users/ — list users for RBAC administration.
+
+    Search: ?q= matches name or email. Requires "user.view".
+    Reuses accounts.UserSerializer; response shape mirrors the other list
+    endpoints ({"results": [...]}).
+    """
+
+    permission_classes = [PermissionRequired]
+    permission_code = "user.view"
+
+    def get(self, request):
+        qs = User.objects.all().order_by("name")
+        q = request.query_params.get("q")
+        if q:
+            qs = qs.filter(Q(name__icontains=q) | Q(email__icontains=q))
+        return Response({"results": UserSerializer(qs, many=True).data})
+
+
+class UserDetailView(APIView):
+    """GET /api/auth/users/{id}/ — a user with their assigned role and
+    effective permission set. Requires "user.view".
+
+    Reuses existing serializers/service: UserSerializer, RoleSerializer,
+    PermissionSerializer, and PermissionService.permissions_for().
+    """
+
+    permission_classes = [PermissionRequired]
+    permission_code = "user.view"
+
+    def get(self, request, pk):
+        target = get_object_or_404(User, pk=pk)
+        role = (
+            Role.objects.filter(user_roles__user=target)
+            .order_by("-priority")
+            .first()
+        )
+        granted = PermissionService.permissions_for(target)
+        return Response(
+            {
+                "user": UserSerializer(target).data,
+                "role": RoleSerializer(role).data if role else None,
+                "permissions": PermissionSerializer(granted, many=True).data,
+            }
         )
 
 

@@ -6,7 +6,7 @@ attendance, waitlist, and EMR logic.
 from datetime import timedelta
 from decimal import Decimal
 
-from django.db.models import Avg, Sum
+from django.db.models import Avg, Q, Sum
 from django.http import HttpResponse
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
@@ -44,6 +44,45 @@ def _invoice_for(pk, user, permission_code=None):
 
 def _serialize(invoice, request):
     return InvoiceSerializer(invoice, context={"request": request}).data
+
+
+class AdminInvoiceListView(APIView):
+    """GET /api/billing/invoices/ — all invoices across the hospital, for staff.
+
+    Filters: ?status= ?payment_status= ?patient=<id> ?q= (invoice number or
+    patient name/email). Reuses InvoiceSerializer. Requires "billing.view".
+    Additive — does not alter the patient-scoped GET /api/billing/my-invoices/.
+    """
+
+    permission_classes = [PermissionRequired]
+    permission_code = "billing.view"
+
+    def get(self, request):
+        qs = Invoice.objects.select_related("doctor", "patient").prefetch_related(
+            "items", "payments", "refunds"
+        )
+        p = request.query_params
+        if p.get("status"):
+            qs = qs.filter(status=p["status"])
+        if p.get("payment_status"):
+            qs = qs.filter(payment_status=p["payment_status"])
+        if p.get("patient"):
+            qs = qs.filter(patient_id=p["patient"])
+        if p.get("q"):
+            term = p["q"]
+            qs = qs.filter(
+                Q(invoice_number__icontains=term)
+                | Q(patient__name__icontains=term)
+                | Q(patient__email__icontains=term)
+            )
+        qs = qs.order_by("-issued_at")
+        return Response(
+            {
+                "results": InvoiceSerializer(
+                    qs, many=True, context={"request": request}
+                ).data
+            }
+        )
 
 
 class MyInvoicesView(APIView):

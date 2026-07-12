@@ -137,6 +137,31 @@ class AppointmentSerializer(serializers.ModelSerializer):
         return super().create(validated_data)
 
 
+class AdminAppointmentSerializer(AppointmentSerializer):
+    """Staff/admin appointment serializer.
+
+    Extends AppointmentSerializer with read-only patient identity for the web
+    admin list. The base serializer (used by patient-facing endpoints and the
+    mobile app) is left unchanged; only these additive fields are exposed here.
+    `patient_reference` is derived from the patient's id, as no dedicated
+    patient code exists on the model.
+    """
+
+    patient_id = serializers.IntegerField(source="patient.id", read_only=True)
+    patient_name = serializers.CharField(source="patient.name", read_only=True)
+    patient_reference = serializers.SerializerMethodField()
+
+    class Meta(AppointmentSerializer.Meta):
+        fields = AppointmentSerializer.Meta.fields + (
+            "patient_id",
+            "patient_name",
+            "patient_reference",
+        )
+
+    def get_patient_reference(self, obj):
+        return f"PAT-{obj.patient_id:04d}" if obj.patient_id else None
+
+
 class WaitlistEntrySerializer(serializers.ModelSerializer):
     doctor_detail = DoctorSerializer(source="doctor", read_only=True)
     preferred_time_label = serializers.SerializerMethodField()

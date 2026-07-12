@@ -1,11 +1,12 @@
 from datetime import datetime, timedelta
 
 from django.db import transaction
-from django.db.models import Avg, Count
+from django.db.models import Avg, Count, Q
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from rest_framework import generics, permissions, status
 from rest_framework.exceptions import ValidationError as DRFValidationError
+from rest_framework.pagination import PageNumberPagination
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
@@ -21,6 +22,7 @@ from .models import (
 from .notifications import NotificationService
 from .predictions import DurationPredictionService
 from .serializers import (
+    AdminAppointmentSerializer,
     AppointmentSerializer,
     VisitTypeSerializer,
     WaitlistEntrySerializer,
@@ -77,6 +79,78 @@ class PredictDurationView(APIView):
             source=prediction.source,
         )
         return Response(prediction.as_dict())
+
+
+class AdminAppointmentPagination(PageNumberPagination):
+    """Opt-in pagination for the admin appointments list.
+
+    Pagination activates only when a `page_size` (and/or `page`) query param is
+    supplied. Without it, `paginate_queryset` returns None and the view falls
+    back to the existing full `{"results": [...]}` list, so existing callers are
+    unaffected.
+    """
+
+    page_size = None
+    page_size_query_param = "page_size"
+    max_page_size = 200
+
+
+class AdminAppointmentListView(APIView):
+    """GET /api/admin/appointments/ — all appointments across the hospital,
+    for staff.
+
+    Filters: ?status= ?doctor=<id> ?date=YYYY-MM-DD ?date_from= ?date_to=
+    ?q= (patient or doctor name/email). Reuses AdminAppointmentSerializer
+    (adds read-only patient identity). Requires "appointment.view". This is
+    additive and does not alter the patient-scoped GET /api/appointments/ list.
+
+    Pagination (count/next/previous/results) is applied only when a page_size
+    query param is supplied; otherwise the full {"results": [...]} list is
+    returned, unchanged.
+    """
+
+    permission_classes = [PermissionRequired]
+    permission_code = "appointment.view"
+
+    def get(self, request):
+        qs = Appointment.objects.select_related(
+            "doctor", "doctor__specialty", "visit_type", "patient"
+        )
+        p = request.query_params
+        if p.get("status"):
+            qs = qs.filter(status=p["status"])
+        if p.get("doctor"):
+            qs = qs.filter(doctor_id=p["doctor"])
+        if p.get("date"):
+            qs = qs.filter(date=p["date"])
+        if p.get("date_from"):
+            qs = qs.filter(date__gte=p["date_from"])
+        if p.get("date_to"):
+            qs = qs.filter(date__lte=p["date_to"])
+        if p.get("q"):
+            term = p["q"]
+            qs = qs.filter(
+                Q(patient__name__icontains=term)
+                | Q(patient__email__icontains=term)
+                | Q(doctor__name__icontains=term)
+            )
+        qs = qs.order_by("-date", "-time")
+
+        paginator = AdminAppointmentPagination()
+        page = paginator.paginate_queryset(qs, request, view=self)
+        if page is not None:
+            data = AdminAppointmentSerializer(
+                page, many=True, context={"request": request}
+            ).data
+            return paginator.get_paginated_response(data)
+
+        return Response(
+            {
+                "results": AdminAppointmentSerializer(
+                    qs, many=True, context={"request": request}
+                ).data
+            }
+        )
 
 
 class AppointmentListCreateView(generics.ListCreateAPIView):
