@@ -58,6 +58,7 @@ INSTALLED_APPS = [
     "medical_records",
     "billing",
     "authorization",
+    "notifications",
 ]
 
 MIDDLEWARE = [
@@ -166,4 +167,20 @@ else:
         "CORS_ALLOWED_ORIGINS must be set to at least one explicit origin "
         "via the environment when DEBUG=False."
     )
+
+# Email (password reset). Defaults to the console backend so reset emails
+# are visible in the server log with zero setup; set EMAIL_BACKEND (and the
+# usual EMAIL_HOST/PORT/HOST_USER/HOST_PASSWORD/USE_TLS) via the environment
+# to send real email in production — no code change required.
+EMAIL_BACKEND = os.getenv(
+    "EMAIL_BACKEND", "django.core.mail.backends.console.EmailBackend"
+)
+EMAIL_HOST = os.getenv("EMAIL_HOST", "")
+EMAIL_PORT = int(os.getenv("EMAIL_PORT", "587"))
+EMAIL_HOST_USER = os.getenv("EMAIL_HOST_USER", "")
+EMAIL_HOST_PASSWORD = os.getenv("EMAIL_HOST_PASSWORD", "")
+EMAIL_USE_TLS = os.getenv("EMAIL_USE_TLS", "True").lower() in ("1", "true", "yes")
+DEFAULT_FROM_EMAIL = os.getenv(
+    "DEFAULT_FROM_EMAIL", "no-reply@sanctuaryhealth.example"
+)
 

@@ -13,14 +13,19 @@ A booked interval and the grid it is tested against:
     Grid slots    : 09:00 09:30 10:00 10:30 11:00 11:30
 """
 
+import tempfile
 from datetime import date, time
 
+from django.core.files.uploadedfile import SimpleUploadedFile
+from django.test import override_settings
 from django.urls import reverse
+from django.utils import timezone
 from rest_framework.test import APITestCase
 
 from accounts.models import User
 from doctors.models import Doctor, DoctorSchedule, Specialty
 from appointments.models import Appointment
+from medical_records.models import MedicalVisit
 
 
 # A fixed future Monday so weekday() == 0 lines up with the schedule below.
@@ -157,3 +162,208 @@ class LegacySlotsOverlapTests(APITestCase):
         avail = self._slots()
         self.assertFalse(avail["09:00"])
         self.assertFalse(avail["09:30"])
+
+
+MEDIA = tempfile.mkdtemp()
+
+
+@override_settings(MEDIA_ROOT=MEDIA)
+class DoctorMeVisitTests(APITestCase):
+    """Regression tests for the doctor self-service EMR endpoints
+    (/api/doctors/me/visits/...). Confirms: IsLinkedDoctor gating, strict
+    per-doctor scoping (a doctor never sees or can write another doctor's
+    visit), and that notes/prescription/reports reuse the existing
+    MedicalVisit/Prescription/LabReport models without touching the
+    patient- or admin-scoped medical_records endpoints."""
+
+    @classmethod
+    def setUpTestData(cls):
+        specialty = Specialty.objects.create(name="Cardiology")
+
+        cls.doctor_user = User.objects.create_user(
+            email="doc-a@example.com", password="x", name="Dr. A"
+        )
+        cls.doctor = Doctor.objects.create(
+            name="Dr. A", specialty=specialty, hospital="Central",
+            user=cls.doctor_user,
+        )
+
+        cls.other_doctor_user = User.objects.create_user(
+            email="doc-b@example.com", password="x", name="Dr. B"
+        )
+        cls.other_doctor = Doctor.objects.create(
+            name="Dr. B", specialty=specialty, hospital="Central",
+            user=cls.other_doctor_user,
+        )
+
+        cls.unlinked_user = User.objects.create_user(
+            email="patient@example.com", password="x", name="Pat"
+        )
+
+        cls.patient = User.objects.create_user(
+            email="pat2@example.com", password="x", name="Patient Two"
+        )
+
+    def _completed_visit(self, doctor, patient=None):
+        appt = Appointment.objects.create(
+            doctor=doctor,
+            patient=patient or self.patient,
+            date=timezone.localdate(),
+            time=time(10, 0),
+            estimated_duration=30,
+            status=Appointment.Status.CONFIRMED,
+        )
+        appt.status = Appointment.Status.COMPLETED
+        appt.save(update_fields=["status", "updated_at"])
+        return MedicalVisit.objects.get(appointment=appt)
+
+    # -- permission gating ---------------------------------------------- #
+
+    def test_unlinked_user_is_forbidden(self):
+        visit = self._completed_visit(self.doctor)
+        self.client.force_authenticate(self.unlinked_user)
+        resp = self.client.get(reverse("doctor-me-visit-list"))
+        self.assertEqual(resp.status_code, 403)
+        resp = self.client.get(
+            reverse("doctor-me-visit-detail", args=[visit.id])
+        )
+        self.assertEqual(resp.status_code, 403)
+
+    def test_anonymous_is_unauthorized(self):
+        resp = self.client.get(reverse("doctor-me-visit-list"))
+        self.assertEqual(resp.status_code, 401)
+
+    # -- list / detail scoping -------------------------------------------- #
+
+    def test_list_only_returns_own_visits(self):
+        mine = self._completed_visit(self.doctor)
+        self._completed_visit(self.other_doctor)
+
+        self.client.force_authenticate(self.doctor_user)
+        resp = self.client.get(reverse("doctor-me-visit-list"))
+        self.assertEqual(resp.status_code, 200)
+        ids = {row["id"] for row in resp.data["results"]}
+        self.assertEqual(ids, {mine.id})
+
+    def test_detail_of_own_visit(self):
+        visit = self._completed_visit(self.doctor)
+        self.client.force_authenticate(self.doctor_user)
+        resp = self.client.get(
+            reverse("doctor-me-visit-detail", args=[visit.id])
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data["id"], visit.id)
+
+    def test_cannot_view_another_doctors_visit(self):
+        visit = self._completed_visit(self.other_doctor)
+        self.client.force_authenticate(self.doctor_user)
+        resp = self.client.get(
+            reverse("doctor-me-visit-detail", args=[visit.id])
+        )
+        self.assertEqual(resp.status_code, 404)
+
+    # -- notes (Consultation) --------------------------------------------- #
+
+    def test_patch_notes_updates_own_visit(self):
+        visit = self._completed_visit(self.doctor)
+        self.client.force_authenticate(self.doctor_user)
+        resp = self.client.patch(
+            reverse("doctor-me-visit-notes", args=[visit.id]),
+            {
+                "chief_complaint": "Chest pain",
+                "diagnosis": "Angina",
+                "clinical_notes": "Stable, prescribed nitroglycerin.",
+            },
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 200)
+        visit.refresh_from_db()
+        self.assertEqual(visit.diagnosis, "Angina")
+        self.assertEqual(visit.chief_complaint, "Chest pain")
+
+    def test_cannot_patch_notes_on_another_doctors_visit(self):
+        visit = self._completed_visit(self.other_doctor)
+        self.client.force_authenticate(self.doctor_user)
+        resp = self.client.patch(
+            reverse("doctor-me-visit-notes", args=[visit.id]),
+            {"diagnosis": "Hijacked"},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 404)
+        visit.refresh_from_db()
+        self.assertNotEqual(visit.diagnosis, "Hijacked")
+
+    # -- prescription (Write Prescription) -------------------------------- #
+
+    def test_patch_prescription_creates_line(self):
+        visit = self._completed_visit(self.doctor)
+        self.client.force_authenticate(self.doctor_user)
+        resp = self.client.patch(
+            reverse("doctor-me-visit-prescription", args=[visit.id]),
+            {
+                "medicine": "Atorvastatin",
+                "dosage": "20mg",
+                "frequency": "Once daily",
+                "duration": "30 days",
+            },
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 201)
+        self.assertEqual(visit.prescriptions.count(), 1)
+        self.assertEqual(visit.prescriptions.first().medicine, "Atorvastatin")
+
+    def test_cannot_prescribe_on_another_doctors_visit(self):
+        visit = self._completed_visit(self.other_doctor)
+        self.client.force_authenticate(self.doctor_user)
+        resp = self.client.patch(
+            reverse("doctor-me-visit-prescription", args=[visit.id]),
+            {"medicine": "Hijacked"},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 404)
+        self.assertEqual(visit.prescriptions.count(), 0)
+
+    # -- reports (Upload Reports) ------------------------------------------ #
+
+    def test_upload_report_on_own_visit(self):
+        visit = self._completed_visit(self.doctor)
+        self.client.force_authenticate(self.doctor_user)
+        file = SimpleUploadedFile(
+            "bloodwork.pdf", b"%PDF-1.4 test", content_type="application/pdf"
+        )
+        resp = self.client.post(
+            reverse("doctor-me-visit-reports", args=[visit.id]),
+            {"title": "Bloodwork", "file": file},
+            format="multipart",
+        )
+        self.assertEqual(resp.status_code, 201)
+        self.assertEqual(visit.reports.count(), 1)
+        self.assertEqual(visit.reports.first().uploaded_by_id, self.doctor_user.id)
+
+    def test_cannot_upload_report_on_another_doctors_visit(self):
+        visit = self._completed_visit(self.other_doctor)
+        self.client.force_authenticate(self.doctor_user)
+        file = SimpleUploadedFile(
+            "bloodwork.pdf", b"%PDF-1.4 test", content_type="application/pdf"
+        )
+        resp = self.client.post(
+            reverse("doctor-me-visit-reports", args=[visit.id]),
+            {"title": "Bloodwork", "file": file},
+            format="multipart",
+        )
+        self.assertEqual(resp.status_code, 404)
+        self.assertEqual(visit.reports.count(), 0)
+
+    # -- other endpoints unaffected --------------------------------------- #
+
+    def test_patient_scoped_visit_endpoint_still_patient_only(self):
+        """Guard against accidentally widening the pre-existing
+        patient-scoped medical_records endpoints while adding this file."""
+        visit = self._completed_visit(self.doctor)
+        self.client.force_authenticate(self.doctor_user)
+        resp = self.client.get(reverse("record-visits"))
+        self.assertEqual(resp.status_code, 200)
+        # The treating doctor is not the visit's patient, so the
+        # patient-scoped list must not return it to them.
+        ids = {row["id"] for row in resp.data["results"]}
+        self.assertNotIn(visit.id, ids)

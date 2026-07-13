@@ -30,9 +30,24 @@ class UserManager(BaseUserManager):
 class User(AbstractUser):
     """Patient/staff account. Email is the login identifier."""
 
+    class Gender(models.TextChoices):
+        FEMALE = "female"
+        MALE = "male"
+        OTHER = "other"
+
     username = None
     email = models.EmailField(unique=True)
     name = models.CharField(max_length=150)
+
+    # --- Patient profile (additive, mobile app) ---
+    phone = models.CharField(max_length=32, blank=True, default="")
+    gender = models.CharField(
+        max_length=10, choices=Gender.choices, blank=True, default=""
+    )
+    date_of_birth = models.DateField(null=True, blank=True)
+    profile_photo = models.FileField(
+        upload_to="user_profiles/%Y/%m/", null=True, blank=True
+    )
 
     USERNAME_FIELD = "email"
     REQUIRED_FIELDS = ["name"]

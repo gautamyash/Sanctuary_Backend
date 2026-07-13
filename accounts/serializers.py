@@ -8,8 +8,35 @@ User = get_user_model()
 class UserSerializer(serializers.ModelSerializer):
     class Meta:
         model = User
-        fields = ("id", "name", "email", "date_joined", "is_staff")
-        read_only_fields = fields
+        fields = (
+            "id",
+            "name",
+            "email",
+            "date_joined",
+            "is_staff",
+            "phone",
+            "gender",
+            "date_of_birth",
+            "profile_photo",
+        )
+        read_only_fields = ("id", "email", "date_joined", "is_staff")
+
+
+class UserUpdateSerializer(serializers.ModelSerializer):
+    """PATCH /api/auth/me/ shape. Email is intentionally not editable here —
+    changing a login identifier needs its own re-verification flow, which is
+    out of scope for this pass."""
+
+    class Meta:
+        model = User
+        fields = ("name", "phone", "gender", "date_of_birth", "profile_photo")
+        extra_kwargs = {
+            "name": {"required": False},
+            "phone": {"required": False},
+            "gender": {"required": False},
+            "date_of_birth": {"required": False},
+            "profile_photo": {"required": False},
+        }
 
 
 class RegisterSerializer(serializers.ModelSerializer):
@@ -27,3 +54,13 @@ class RegisterSerializer(serializers.ModelSerializer):
             password=validated_data["password"],
             name=validated_data["name"],
         )
+
+
+class PasswordResetRequestSerializer(serializers.Serializer):
+    email = serializers.EmailField()
+
+
+class PasswordResetConfirmSerializer(serializers.Serializer):
+    uid = serializers.CharField()
+    token = serializers.CharField()
+    new_password = serializers.CharField(validators=[validate_password])

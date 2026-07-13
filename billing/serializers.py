@@ -6,6 +6,8 @@ from .models import (
     Coupon,
     Invoice,
     InvoiceItem,
+    InsuranceClaim,
+    InsuranceProvider,
     MedicalService,
     Payment,
     Refund,
@@ -127,3 +129,30 @@ class InvoiceSerializer(serializers.ModelSerializer):
 
     def get_patient_name(self, obj):
         return getattr(obj.patient, "name", None) or obj.patient.email
+
+
+class InsuranceProviderSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = InsuranceProvider
+        fields = ("id", "name", "contact", "active")
+        read_only_fields = fields
+
+
+class InsuranceClaimSerializer(serializers.ModelSerializer):
+    provider = InsuranceProviderSerializer(read_only=True)
+    invoice_number = serializers.CharField(source="invoice.invoice_number", read_only=True)
+
+    class Meta:
+        model = InsuranceClaim
+        fields = (
+            "id",
+            "invoice",
+            "invoice_number",
+            "provider",
+            "claim_number",
+            "approved_amount",
+            "status",
+            "submitted_at",
+            "approved_at",
+        )
+        read_only_fields = fields

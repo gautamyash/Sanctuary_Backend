@@ -132,7 +132,12 @@ class DoctorLeaveListCreateView(generics.ListCreateAPIView):
 
 
 class DoctorLeaveDetailView(generics.RetrieveUpdateDestroyAPIView):
-    """GET/PUT/PATCH/DELETE /api/doctors/{doctor_id}/leaves/{id}/"""
+    """GET/PUT/PATCH/DELETE /api/doctors/{doctor_id}/leaves/{id}/
+
+    Reviewing a self-service leave request (created by a doctor via
+    /api/doctors/me/leaves/) happens here: when staff PATCH `status` to
+    approved/rejected, `approved_by`/`approved_at` are stamped
+    automatically — additive, the admin panel does not need to send them."""
 
     serializer_class = DoctorLeaveSerializer
     permission_classes = [PermissionRequired]
@@ -140,6 +145,18 @@ class DoctorLeaveDetailView(generics.RetrieveUpdateDestroyAPIView):
 
     def get_queryset(self):
         return DoctorLeave.objects.filter(doctor_id=self.kwargs["doctor_id"])
+
+    def perform_update(self, serializer):
+        if "status" in serializer.validated_data and serializer.validated_data[
+            "status"
+        ] != serializer.instance.status:
+            from django.utils import timezone
+
+            serializer.save(
+                approved_by=self.request.user, approved_at=timezone.now()
+            )
+        else:
+            serializer.save()
 
 
 class DoctorSlotsView(APIView):

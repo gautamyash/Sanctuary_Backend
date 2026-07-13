@@ -17,8 +17,9 @@ from rest_framework.views import APIView
 from authorization.permissions import PermissionRequired
 from authorization.services import PermissionService
 
-from .models import Invoice, InvoiceItem, MedicalService, Payment, Refund
+from .models import InsuranceClaim, Invoice, InvoiceItem, MedicalService, Payment, Refund
 from .serializers import (
+    InsuranceClaimSerializer,
     InvoiceSerializer,
     MedicalServiceSerializer,
     PaymentSerializer,
@@ -246,6 +247,23 @@ class InvoicePdfView(APIView):
             f'inline; filename="{invoice.invoice_number}.pdf"'
         )
         return resp
+
+
+class MyInsuranceView(APIView):
+    """GET /api/billing/my-insurance/ — read-only. Existing InsuranceProvider
+    / InsuranceClaim data for the caller's own invoices; no new models.
+    Note: these models track per-claim status/amounts only — there is no
+    stored deductible/out-of-pocket policy figure, so a client rendering a
+    coverage summary should treat those as unavailable rather than assume
+    they exist here."""
+
+    def get(self, request):
+        claims = (
+            InsuranceClaim.objects.filter(invoice__patient=request.user)
+            .select_related("provider", "invoice")
+            .order_by("-submitted_at")
+        )
+        return Response({"results": InsuranceClaimSerializer(claims, many=True).data})
 
 
 class ServiceCatalogView(APIView):

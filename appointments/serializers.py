@@ -166,6 +166,10 @@ class WaitlistEntrySerializer(serializers.ModelSerializer):
     doctor_detail = DoctorSerializer(source="doctor", read_only=True)
     preferred_time_label = serializers.SerializerMethodField()
     offered_time_label = serializers.SerializerMethodField()
+    # Computed, never persisted: 1-based rank among this doctor/date's
+    # active (waiting/offered) entries, ordered by joined_at — i.e. "how
+    # many people are ahead of or at this entry". Recomputed on every read.
+    position = serializers.SerializerMethodField()
 
     class Meta:
         model = WaitlistEntry
@@ -180,6 +184,7 @@ class WaitlistEntrySerializer(serializers.ModelSerializer):
             "offered_time_label",
             "offered_duration",
             "status",
+            "position",
             "joined_at",
             "offered_at",
             "expires_at",
@@ -190,6 +195,7 @@ class WaitlistEntrySerializer(serializers.ModelSerializer):
             "offered_time",
             "offered_duration",
             "status",
+            "position",
             "joined_at",
             "offered_at",
             "expires_at",
@@ -201,6 +207,18 @@ class WaitlistEntrySerializer(serializers.ModelSerializer):
 
     def get_offered_time_label(self, obj):
         return _time_label(obj.offered_time)
+
+    def get_position(self, obj):
+        if obj.status not in WaitlistEntry.ACTIVE_STATUSES:
+            return None
+        return (
+            WaitlistEntry.objects.filter(
+                doctor_id=obj.doctor_id,
+                date=obj.date,
+                status__in=WaitlistEntry.ACTIVE_STATUSES,
+                joined_at__lte=obj.joined_at,
+            ).count()
+        )
 
     def validate_date(self, value):
         if value < date_cls.today():

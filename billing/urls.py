@@ -7,6 +7,7 @@ from .views import (
     BillingAnalyticsView,
     InvoiceDetailView,
     InvoicePdfView,
+    MyInsuranceView,
     MyInvoicesView,
     RecordPaymentView,
     RefundView,
@@ -15,6 +16,7 @@ from .views import (
 
 urlpatterns = [
     path("billing/my-invoices/", MyInvoicesView.as_view(), name="my-invoices"),
+    path("billing/my-insurance/", MyInsuranceView.as_view(), name="my-insurance"),
     path("billing/services/", ServiceCatalogView.as_view(), name="billing-services"),
     path("billing/analytics/", BillingAnalyticsView.as_view(), name="billing-analytics"),
     path("billing/invoices/", AdminInvoiceListView.as_view(), name="invoice-list"),

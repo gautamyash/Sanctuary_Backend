@@ -122,6 +122,33 @@ class MedicalVisitSerializer(serializers.ModelSerializer):
         return None
 
 
+class DoctorVisitSerializer(MedicalVisitSerializer):
+    """Additive subclass used only by the doctor self-service EMR endpoints
+    (/api/doctors/me/visits/...). MedicalVisitSerializer itself is unchanged
+    and keeps serving the patient- and admin-scoped views exactly as before;
+    this adds the one field a treating doctor needs that a patient viewing
+    their own visit does not — who the visit belongs to — via the existing
+    accounts.serializers.UserSerializer."""
+
+    patient = serializers.SerializerMethodField()
+
+    class Meta(MedicalVisitSerializer.Meta):
+        fields = MedicalVisitSerializer.Meta.fields + ("patient",)
+        read_only_fields = fields
+
+    def get_patient(self, obj):
+        from accounts.serializers import UserSerializer
+
+        return UserSerializer(obj.patient).data
+
+    def get_clinical_notes(self, obj):
+        # The treating doctor always sees their own documentation in full —
+        # the patient-vs-emr.edit gate on the base serializer doesn't apply
+        # here since IsLinkedDoctor + doctor-ownership scoping already
+        # guarantees this is the doctor who owns the visit.
+        return obj.clinical_notes
+
+
 class PatientRecordSerializer(serializers.ModelSerializer):
     allergies = AllergySerializer(many=True, read_only=True)
     medications = MedicationSerializer(many=True, read_only=True)
