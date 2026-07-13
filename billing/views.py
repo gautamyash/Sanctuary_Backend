@@ -49,8 +49,9 @@ def _serialize(invoice, request):
 class AdminInvoiceListView(APIView):
     """GET /api/billing/invoices/ — all invoices across the hospital, for staff.
 
-    Filters: ?status= ?payment_status= ?patient=<id> ?q= (invoice number or
-    patient name/email). Reuses InvoiceSerializer. Requires "billing.view".
+    Filters: ?status= ?payment_status= ?patient=<id> ?date_from= ?date_to=
+    (both match against issued_at) ?q= (invoice number or patient
+    name/email). Reuses InvoiceSerializer. Requires "billing.view".
     Additive — does not alter the patient-scoped GET /api/billing/my-invoices/.
     """
 
@@ -68,6 +69,10 @@ class AdminInvoiceListView(APIView):
             qs = qs.filter(payment_status=p["payment_status"])
         if p.get("patient"):
             qs = qs.filter(patient_id=p["patient"])
+        if p.get("date_from"):
+            qs = qs.filter(issued_at__date__gte=p["date_from"])
+        if p.get("date_to"):
+            qs = qs.filter(issued_at__date__lte=p["date_to"])
         if p.get("q"):
             term = p["q"]
             qs = qs.filter(

@@ -35,6 +35,20 @@ class Doctor(models.Model):
     is_active = models.BooleanField(default=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
+    # Live status (Doctor Management module). Independent booleans rather
+    # than a single choice field, matching how the design treats them as
+    # separate signals (a doctor can be neither on_duty nor on_leave, e.g.
+    # off-shift).
+    on_duty = models.BooleanField(default=False)
+    on_leave = models.BooleanField(default=False)
+
+    # Physical location (Doctor Management module). Free-text, matching the
+    # existing `address` field's style rather than a constrained/enum
+    # location model, since none is required.
+    wing = models.CharField(max_length=50, blank=True, default="")
+    floor = models.CharField(max_length=20, blank=True, default="")
+    room = models.CharField(max_length=50, blank=True, default="")
+
     class Meta:
         ordering = ["-rating", "name"]
         indexes = [
@@ -71,3 +85,23 @@ class DoctorSchedule(models.Model):
 
     def __str__(self):
         return f"{self.doctor} {self.get_weekday_display()} {self.start_time}-{self.end_time}"
+
+
+class DoctorLeave(models.Model):
+    """A simple date-range leave record for a doctor (Doctor Management
+    module). Read by the admin panel only — does not feed into scheduling,
+    the queue, or slot availability."""
+
+    doctor = models.ForeignKey(
+        Doctor, on_delete=models.CASCADE, related_name="leaves"
+    )
+    start_date = models.DateField()
+    end_date = models.DateField()
+    reason = models.CharField(max_length=255, blank=True, default="")
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-start_date"]
+
+    def __str__(self):
+        return f"{self.doctor} leave {self.start_date}–{self.end_date}"

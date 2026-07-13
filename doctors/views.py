@@ -5,8 +5,16 @@ from rest_framework import generics, permissions
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from .models import Doctor, Specialty
-from .serializers import DoctorSerializer, SpecialtySerializer
+from authorization.permissions import PermissionRequired
+
+from .models import Doctor, DoctorLeave, DoctorSchedule, Specialty
+from .serializers import (
+    DoctorLeaveSerializer,
+    DoctorScheduleSerializer,
+    DoctorSerializer,
+    DoctorWriteSerializer,
+    SpecialtySerializer,
+)
 
 
 class SpecialtyListView(generics.ListAPIView):
@@ -16,14 +24,25 @@ class SpecialtyListView(generics.ListAPIView):
     pagination_class = None
 
 
-class DoctorListView(generics.ListAPIView):
-    """GET /api/doctors/?specialty=Cardiology&search=sarah"""
+class DoctorListView(generics.ListCreateAPIView):
+    """GET /api/doctors/?specialty=Cardiology&search=sarah — public directory
+    (unchanged). POST /api/doctors/ — onboard a new doctor (Doctor Management
+    module, requires system.admin; no dedicated doctor.* permission code
+    exists in the RBAC catalog yet, so this reuses the existing
+    administrative code rather than inventing one)."""
 
-    serializer_class = DoctorSerializer
-    permission_classes = [permissions.AllowAny]
     search_fields = ("name", "hospital", "specialty__name")
     ordering_fields = ("rating", "fee", "distance_km")
     filterset_fields = {"specialty__name": ["exact"]}
+    permission_code = "system.admin"
+
+    def get_permissions(self):
+        if self.request.method == "GET":
+            return [permissions.AllowAny()]
+        return [PermissionRequired()]
+
+    def get_serializer_class(self):
+        return DoctorSerializer if self.request.method == "GET" else DoctorWriteSerializer
 
     def get_queryset(self):
         qs = Doctor.objects.filter(is_active=True).select_related("specialty")
@@ -32,11 +51,95 @@ class DoctorListView(generics.ListAPIView):
             qs = qs.filter(specialty__name__iexact=specialty)
         return qs
 
+    def create(self, request, *args, **kwargs):
+        response = super().create(request, *args, **kwargs)
+        doctor = Doctor.objects.select_related("specialty").get(pk=response.data["id"])
+        response.data = DoctorSerializer(doctor).data
+        return response
 
-class DoctorDetailView(generics.RetrieveAPIView):
-    queryset = Doctor.objects.filter(is_active=True).select_related("specialty")
-    serializer_class = DoctorSerializer
-    permission_classes = [permissions.AllowAny]
+
+class DoctorDetailView(generics.RetrieveUpdateDestroyAPIView):
+    """GET /api/doctors/{id}/ — unchanged public detail. PUT/PATCH — edit
+    (Doctor Management, system.admin). DELETE — soft delete: sets
+    is_active=False (the flag the rest of the app already uses to hide a
+    doctor), it does not remove the row."""
+
+    permission_code = "system.admin"
+
+    def get_permissions(self):
+        if self.request.method == "GET":
+            return [permissions.AllowAny()]
+        return [PermissionRequired()]
+
+    def get_serializer_class(self):
+        return DoctorSerializer if self.request.method == "GET" else DoctorWriteSerializer
+
+    def get_queryset(self):
+        return Doctor.objects.filter(is_active=True).select_related("specialty")
+
+    def update(self, request, *args, **kwargs):
+        response = super().update(request, *args, **kwargs)
+        doctor = Doctor.objects.select_related("specialty").get(pk=response.data["id"])
+        response.data = DoctorSerializer(doctor).data
+        return response
+
+    def perform_destroy(self, instance):
+        instance.is_active = False
+        instance.save(update_fields=["is_active"])
+
+
+class DoctorScheduleListCreateView(generics.ListCreateAPIView):
+    """GET/POST /api/doctors/{doctor_id}/schedules/ — a doctor's weekly
+    working-hour blocks (Doctor Management, system.admin)."""
+
+    serializer_class = DoctorScheduleSerializer
+    permission_classes = [PermissionRequired]
+    permission_code = "system.admin"
+
+    def get_queryset(self):
+        return DoctorSchedule.objects.filter(doctor_id=self.kwargs["doctor_id"])
+
+    def perform_create(self, serializer):
+        doctor = get_object_or_404(Doctor, pk=self.kwargs["doctor_id"])
+        serializer.save(doctor=doctor)
+
+
+class DoctorScheduleDetailView(generics.RetrieveUpdateDestroyAPIView):
+    """GET/PUT/PATCH/DELETE /api/doctors/{doctor_id}/schedules/{id}/"""
+
+    serializer_class = DoctorScheduleSerializer
+    permission_classes = [PermissionRequired]
+    permission_code = "system.admin"
+
+    def get_queryset(self):
+        return DoctorSchedule.objects.filter(doctor_id=self.kwargs["doctor_id"])
+
+
+class DoctorLeaveListCreateView(generics.ListCreateAPIView):
+    """GET/POST /api/doctors/{doctor_id}/leaves/ — simple date-range leave
+    records (Doctor Management, system.admin)."""
+
+    serializer_class = DoctorLeaveSerializer
+    permission_classes = [PermissionRequired]
+    permission_code = "system.admin"
+
+    def get_queryset(self):
+        return DoctorLeave.objects.filter(doctor_id=self.kwargs["doctor_id"])
+
+    def perform_create(self, serializer):
+        doctor = get_object_or_404(Doctor, pk=self.kwargs["doctor_id"])
+        serializer.save(doctor=doctor)
+
+
+class DoctorLeaveDetailView(generics.RetrieveUpdateDestroyAPIView):
+    """GET/PUT/PATCH/DELETE /api/doctors/{doctor_id}/leaves/{id}/"""
+
+    serializer_class = DoctorLeaveSerializer
+    permission_classes = [PermissionRequired]
+    permission_code = "system.admin"
+
+    def get_queryset(self):
+        return DoctorLeave.objects.filter(doctor_id=self.kwargs["doctor_id"])
 
 
 class DoctorSlotsView(APIView):
