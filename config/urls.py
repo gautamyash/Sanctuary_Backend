@@ -24,6 +24,7 @@ urlpatterns = [
     path("api/", include("medical_records.urls")),
     path("api/", include("billing.urls")),
     path("api/", include("notifications.urls")),
+    path("api/", include("hospital_config.urls")),
 ]
 
 # Serve uploaded medical documents in development.

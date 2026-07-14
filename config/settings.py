@@ -59,6 +59,7 @@ INSTALLED_APPS = [
     "billing",
     "authorization",
     "notifications",
+    "hospital_config",
 ]
 
 MIDDLEWARE = [
