@@ -6,6 +6,20 @@ User = get_user_model()
 
 
 class UserSerializer(serializers.ModelSerializer):
+    """Shared read shape for User, reused across accounts/ (self-service
+    /api/auth/me/) and authorization/ (admin user list/detail/create/edit
+    output) — never used to validate PATCH/POST input (each of those flows
+    has its own dedicated input serializer), so adding a field here only
+    ever affects what's returned, not what's writable.
+
+    `is_active` added (Phase: Complete User Management) so admin-facing
+    surfaces (Users table, Edit User dialog) can display/pre-fill an
+    account's active status. It was previously omitted entirely, which is
+    why AdminUpdateUserSerializer/AdminCreateUserSerializer always take
+    `is_active` as separate, explicit input rather than reading it back
+    from this serializer.
+    """
+
     class Meta:
         model = User
         fields = (
@@ -14,12 +28,13 @@ class UserSerializer(serializers.ModelSerializer):
             "email",
             "date_joined",
             "is_staff",
+            "is_active",
             "phone",
             "gender",
             "date_of_birth",
             "profile_photo",
         )
-        read_only_fields = ("id", "email", "date_joined", "is_staff")
+        read_only_fields = ("id", "email", "date_joined", "is_staff", "is_active")
 
 
 class UserUpdateSerializer(serializers.ModelSerializer):

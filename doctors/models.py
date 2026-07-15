@@ -81,6 +81,14 @@ class Doctor(models.Model):
         default=30, help_text="Preferred default consultation length in minutes"
     )
 
+    # --- Automatic Staff Profile Linking (additive) ---------------------
+    # Medical license / registration number. Did not exist anywhere in the
+    # schema before this phase; added so an auto-provisioned Doctor profile
+    # has a genuine (empty) value to default to, per that phase's spec, and
+    # so it can be filled in later via the existing Doctor Management edit
+    # form. Blank by default — never required, never backfilled.
+    license_number = models.CharField(max_length=100, blank=True, default="")
+
     class Meta:
         ordering = ["-rating", "name"]
         indexes = [

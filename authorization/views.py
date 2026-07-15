@@ -21,6 +21,9 @@ from accounts.serializers import UserSerializer
 from .models import Permission, Role, UserRole
 from .permissions import PermissionRequired
 from .serializers import (
+    AdminCreateUserSerializer,
+    AdminResetPasswordSerializer,
+    AdminUpdateUserSerializer,
     AssignRoleSerializer,
     PermissionSerializer,
     RoleSerializer,
@@ -106,34 +109,76 @@ class AssignRoleView(APIView):
 
 
 class UserListView(APIView):
-    """GET /api/auth/users/ — list users for RBAC administration.
+    """GET  /api/auth/users/ — list users for RBAC administration.
+    POST /api/auth/users/ — admin-managed user creation.
 
-    Search: ?q= matches name or email. Requires "user.view".
-    Reuses accounts.UserSerializer; response shape mirrors the other list
-    endpoints ({"results": [...]}).
+    GET requires "user.view" (unchanged); POST requires "user.create" — the
+    same per-method permission_code switch already used by
+    HospitalProfileAdminView/FeatureFlagAdminListView in hospital_config, so
+    this reuses an established pattern rather than introducing a new one.
+
+    GET keeps its exact existing behavior: search via ?q=, response shape
+    {"results": [...]}, accounts.UserSerializer. Additive: ?role=<role name>
+    now also filters to users holding that RBAC role (e.g. ?role=Patient),
+    via the existing UserRole/Role join — no new field or model. Omitting
+    the param preserves the exact prior response for every existing caller.
     """
 
-    permission_classes = [PermissionRequired]
-    permission_code = "user.view"
+    def get_permissions(self):
+        self.permission_code = (
+            "user.view" if self.request.method == "GET" else "user.create"
+        )
+        return [PermissionRequired()]
 
     def get(self, request):
         qs = User.objects.all().order_by("name")
         q = request.query_params.get("q")
         if q:
             qs = qs.filter(Q(name__icontains=q) | Q(email__icontains=q))
+        role_name = request.query_params.get("role")
+        if role_name:
+            qs = qs.filter(user_roles__role__name__iexact=role_name).distinct()
         return Response({"results": UserSerializer(qs, many=True).data})
+
+    def post(self, request):
+        serializer = AdminCreateUserSerializer(
+            data=request.data, context={"request": request}
+        )
+        serializer.is_valid(raise_exception=True)
+        with transaction.atomic():
+            user = serializer.save()
+        role = getattr(serializer, "_assigned_role", None)
+        profile_messages = [
+            r.message
+            for r in getattr(serializer, "_provisioning_results", [])
+            if r.message
+        ]
+        return Response(
+            {
+                "user": UserSerializer(user).data,
+                "role": RoleSerializer(role).data if role else None,
+                "profile_messages": profile_messages,
+            },
+            status=status.HTTP_201_CREATED,
+        )
 
 
 class UserDetailView(APIView):
-    """GET /api/auth/users/{id}/ — a user with their assigned role and
-    effective permission set. Requires "user.view".
+    """GET   /api/auth/users/{id}/ — a user with their assigned role and
+                                      effective permission set.
+    PATCH /api/auth/users/{id}/ — admin-managed edit (name, phone, gender,
+                                    is_active, role).
 
-    Reuses existing serializers/service: UserSerializer, RoleSerializer,
-    PermissionSerializer, and PermissionService.permissions_for().
+    GET requires "user.view" (unchanged); PATCH requires "user.edit" — the
+    same per-method permission_code switch already used by UserListView/
+    HospitalProfileAdminView, reused rather than reinvented.
     """
 
-    permission_classes = [PermissionRequired]
-    permission_code = "user.view"
+    def get_permissions(self):
+        self.permission_code = (
+            "user.view" if self.request.method == "GET" else "user.edit"
+        )
+        return [PermissionRequired()]
 
     def get(self, request, pk):
         target = get_object_or_404(User, pk=pk)
@@ -150,6 +195,53 @@ class UserDetailView(APIView):
                 "permissions": PermissionSerializer(granted, many=True).data,
             }
         )
+
+    def patch(self, request, pk):
+        target = get_object_or_404(User, pk=pk)
+        serializer = AdminUpdateUserSerializer(
+            target, data=request.data, partial=True, context={"request": request}
+        )
+        serializer.is_valid(raise_exception=True)
+        with transaction.atomic():
+            user = serializer.save()
+        role = getattr(serializer, "_assigned_role", None)
+        profile_messages = [
+            r.message
+            for r in getattr(serializer, "_provisioning_results", [])
+            if r.message
+        ]
+        return Response(
+            {
+                "user": UserSerializer(user).data,
+                "role": RoleSerializer(role).data if role else None,
+                "profile_messages": profile_messages,
+            }
+        )
+
+
+class ResetPasswordView(APIView):
+    """POST /api/auth/users/{id}/reset-password/ — admin-managed password
+    reset. Requires "user.edit".
+
+    Reuses the exact same hashing path as every other password write in this
+    codebase: `User.set_password()` (see PasswordResetConfirmView), which
+    delegates to Django's configured hasher — nothing new is introduced.
+    Because this simply changes the stored password hash, it does not
+    interact with is_active/deactivation at all; a deactivated user's
+    password can still be reset, but they still cannot authenticate until
+    reactivated (enforced by the existing JWT/auth flow, unchanged here).
+    """
+
+    permission_classes = [PermissionRequired]
+    permission_code = "user.edit"
+
+    def post(self, request, pk):
+        target = get_object_or_404(User, pk=pk)
+        serializer = AdminResetPasswordSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        target.set_password(serializer.validated_data["new_password"])
+        target.save(update_fields=["password"])
+        return Response({"detail": "Password has been reset."})
 
 
 class MyPermissionsView(APIView):

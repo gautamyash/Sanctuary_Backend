@@ -18,7 +18,17 @@ from .serializers import (
 
 
 class SpecialtyListView(generics.ListAPIView):
-    queryset = Specialty.objects.all()
+    """GET /api/specialties/ — public specialty catalog, used by the patient
+    directory filter and the admin Doctor onboarding form.
+
+    Excludes the blank-name sentinel Specialty (Phase: Automatic Staff
+    Profile Linking) that auto-provisioned Doctor profiles are linked to
+    before an admin sets a real specialization — it exists only so
+    `Doctor.specialty` (a required FK) can represent "empty specialization"
+    without becoming nullable; it was never meant to be a selectable option
+    anywhere."""
+
+    queryset = Specialty.objects.exclude(name="")
     serializer_class = SpecialtySerializer
     permission_classes = [permissions.AllowAny]
     pagination_class = None

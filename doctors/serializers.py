@@ -71,6 +71,7 @@ class DoctorSerializer(serializers.ModelSerializer):
             "bio",
             "profile_photo",
             "consultation_duration",
+            "license_number",
             "certifications",
             "languages",
             "education",
@@ -108,6 +109,7 @@ class DoctorWriteSerializer(serializers.ModelSerializer):
             "bio",
             "profile_photo",
             "consultation_duration",
+            "license_number",
         )
         read_only_fields = ("id",)
         extra_kwargs = {
@@ -115,6 +117,7 @@ class DoctorWriteSerializer(serializers.ModelSerializer):
             "bio": {"required": False},
             "profile_photo": {"required": False},
             "consultation_duration": {"required": False},
+            "license_number": {"required": False},
         }
 
 

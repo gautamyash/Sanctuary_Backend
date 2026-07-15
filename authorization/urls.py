@@ -4,6 +4,7 @@ from .views import (
     AssignRoleView,
     MyPermissionsView,
     PermissionListView,
+    ResetPasswordView,
     RoleListCreateView,
     RoleUpdateView,
     UserDetailView,
@@ -17,5 +18,10 @@ urlpatterns = [
     path("users/", UserListView.as_view(), name="user-list"),
     path("users/<int:pk>/", UserDetailView.as_view(), name="user-detail"),
     path("users/<int:pk>/role/", AssignRoleView.as_view(), name="assign-role"),
+    path(
+        "users/<int:pk>/reset-password/",
+        ResetPasswordView.as_view(),
+        name="reset-password",
+    ),
     path("me/permissions/", MyPermissionsView.as_view(), name="my-permissions"),
 ]
