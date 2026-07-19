@@ -325,6 +325,17 @@ class QueueService:
                     if row.estimated_finish
                     else None,
                     "checked_in": appt.patient_checked_in_at is not None,
+                    # Phase: Live Consultation & Queue Workflow — additive.
+                    # Both already exist on Appointment (patient_checked_in_at
+                    # backs the "checked_in" boolean above; attendance_status
+                    # is the independent no-show layer's field); neither was
+                    # previously serialized here. Existing consumers of this
+                    # dict (DoctorQueueView, DoctorMeQueueView) only read the
+                    # keys they already knew about, so this is safe to add.
+                    "checked_in_at": appt.patient_checked_in_at.isoformat()
+                    if appt.patient_checked_in_at
+                    else None,
+                    "attendance_status": appt.attendance_status,
                 }
             )
         return {

@@ -101,6 +101,53 @@ class ConsultationStartView(APIView):
         return Response(QueueService.get_status(appointment))
 
 
+class AppointmentNoShowView(APIView):
+    """POST /api/appointments/{id}/no-show/ — doctor/staff manually marks a
+    missed appointment as a no-show (Phase: Live Consultation & Queue
+    Workflow).
+
+    Before this, `mark_no_show()` (attendance/interventions.py) was only ever
+    invoked by the `detect_no_shows` cron management command — no endpoint
+    let a doctor trigger it directly from the Live Queue panel. This view
+    adds no new business logic: it reuses that exact existing function
+    (reconciles prediction accuracy, notifies, logs, backfills the waitlist
+    if high-risk), then recalculates the queue like every other lifecycle
+    endpoint in this file. Gated on "attendance.manage" — a permission code
+    already seeded in RBAC (granted to Doctor/Nurse) but unused until now,
+    matching the same activate-a-reserved-code pattern used elsewhere in this
+    project (e.g. emr.delete, appointment.create)."""
+
+    permission_classes = [PermissionRequired]
+    permission_code = "attendance.manage"
+
+    def post(self, request, pk):
+        appointment = get_object_or_404(
+            Appointment.objects.select_related("doctor"), pk=pk
+        )
+        if appointment.status not in Appointment.ACTIVE_STATUSES:
+            return Response(
+                {"detail": "Only active appointments can be marked as a no-show."},
+                status=400,
+            )
+        if appointment.patient_checked_in_at is not None:
+            return Response(
+                {"detail": "This patient has already checked in."}, status=400
+            )
+        if appointment.attendance_status == Appointment.Attendance.NO_SHOW:
+            return Response(
+                {"detail": "This appointment is already marked as a no-show."},
+                status=400,
+            )
+
+        from attendance.interventions import mark_no_show
+
+        mark_no_show(appointment)
+        appointment.refresh_from_db()
+
+        QueueService.recalculate_queue(appointment.doctor, appointment.date)
+        return Response(QueueService.get_status(appointment))
+
+
 class QueueStatusView(APIView):
     """GET /api/appointments/{id}/queue-status/ — live status for the owner
     (or staff)."""

@@ -236,6 +236,116 @@ class CompletionTriggersQueueTests(QueueTestBase):
         self.assertIsNone(appt.queue_position)
 
 
+class AppointmentNoShowTests(QueueTestBase):
+    """Phase: Live Consultation & Queue Workflow — manual no-show marking.
+
+    Reuses the existing attendance.interventions.mark_no_show() verbatim
+    (already covered by attendance/tests.py for its own reconciliation/
+    notification/waitlist-backfill behavior); these tests cover only the new
+    endpoint's own guards, permission gate, and that it recalculates the
+    queue like its check-in/start siblings."""
+
+    def setUp(self):
+        self.appt = self._appt(time(9, 0))
+        self.url = reverse("appointment-no-show", args=[self.appt.id])
+
+    def test_staff_can_mark_no_show_and_queue_recalculates(self):
+        self.client.force_authenticate(self.staff)
+        resp = self.client.post(self.url)
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(set(resp.data.keys()), QUEUE_STATUS_KEYS)
+        self.appt.refresh_from_db()
+        self.assertEqual(
+            self.appt.attendance_status, Appointment.Attendance.NO_SHOW
+        )
+        # Status is untouched — attendance is an independent, informational
+        # layer that never cancels the appointment or alters booking.
+        self.assertEqual(self.appt.status, Appointment.Status.CONFIRMED)
+        state = DoctorQueueState.objects.get(doctor=self.doctor, date=self.today)
+        self.assertIsNotNone(state)
+
+    def test_non_staff_cannot_mark_no_show(self):
+        self.client.force_authenticate(self.patient)
+        resp = self.client.post(self.url)
+        self.assertEqual(resp.status_code, 403)
+
+    def test_anonymous_cannot_mark_no_show(self):
+        resp = self.client.post(self.url)
+        self.assertEqual(resp.status_code, 401)
+
+    def test_cannot_mark_no_show_twice(self):
+        self.client.force_authenticate(self.staff)
+        self.client.post(self.url)
+        resp = self.client.post(self.url)
+        self.assertEqual(resp.status_code, 400)
+
+    def test_cannot_mark_no_show_if_already_checked_in(self):
+        self.appt.patient_checked_in_at = timezone.now()
+        self.appt.save(update_fields=["patient_checked_in_at"])
+        self.client.force_authenticate(self.staff)
+        resp = self.client.post(self.url)
+        self.assertEqual(resp.status_code, 400)
+        self.appt.refresh_from_db()
+        self.assertNotEqual(
+            self.appt.attendance_status, Appointment.Attendance.NO_SHOW
+        )
+
+    def test_cannot_mark_no_show_on_completed_appointment(self):
+        self.appt.status = Appointment.Status.COMPLETED
+        self.appt.save(update_fields=["status"])
+        self.client.force_authenticate(self.staff)
+        resp = self.client.post(self.url)
+        self.assertEqual(resp.status_code, 400)
+
+    def test_doctor_role_holds_attendance_manage_and_can_mark(self):
+        """attendance.manage is already seeded to Doctor (and Nurse); this
+        confirms the code the view gates on is actually reachable by a
+        doctor's own account, not just Admin."""
+        doctor_user = User.objects.create_user(
+            email="dr-osei@example.com", password="x", name="Dr. Osei"
+        )
+        UserRole.objects.create(
+            user=doctor_user, role=Role.objects.get(name="Doctor")
+        )
+        self.client.force_authenticate(doctor_user)
+        resp = self.client.post(self.url)
+        self.assertEqual(resp.status_code, 200)
+
+
+class QueueTimelineFieldsTests(QueueTestBase):
+    """Phase: Live Consultation & Queue Workflow — additive fields on
+    build_timeline()'s per-entry dict."""
+
+    def test_timeline_entry_includes_checked_in_at_and_attendance_status(self):
+        appt = self._appt(time(9, 0))
+        appt.patient_checked_in_at = timezone.now()
+        appt.save(update_fields=["patient_checked_in_at"])
+        data = QueueService.build_timeline(self.doctor, self.today)
+        row = data["timeline"][0]
+        self.assertIn("checked_in_at", row)
+        self.assertIn("attendance_status", row)
+        self.assertIsNotNone(row["checked_in_at"])
+        self.assertEqual(row["attendance_status"], Appointment.Attendance.UNKNOWN)
+
+    def test_timeline_entry_checked_in_at_null_when_not_checked_in(self):
+        self._appt(time(9, 0))
+        data = QueueService.build_timeline(self.doctor, self.today)
+        row = data["timeline"][0]
+        self.assertIsNone(row["checked_in_at"])
+
+    def test_timeline_entry_reflects_no_show_status(self):
+        from attendance.interventions import mark_no_show
+
+        appt = self._appt(time(9, 0))
+        mark_no_show(appt)
+        data = QueueService.build_timeline(self.doctor, self.today)
+        row = data["timeline"][0]
+        self.assertEqual(row["attendance_status"], Appointment.Attendance.NO_SHOW)
+        # Existing "state"/"checked_in" contract is untouched by this.
+        self.assertEqual(row["state"], "waiting")
+        self.assertFalse(row["checked_in"])
+
+
 class QueueStatusApiTests(QueueTestBase):
     def test_status_payload_is_stable(self):
         appt = self._appt(

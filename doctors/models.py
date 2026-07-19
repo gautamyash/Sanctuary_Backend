@@ -191,8 +191,14 @@ class DoctorSchedule(models.Model):
 class DoctorLeave(models.Model):
     """A date-range leave record for a doctor. Originally admin-only
     (Doctor Management module); now also created directly by the doctor
-    through the self-service mobile app, then reviewed by staff. Still does
-    not feed into scheduling, the queue, or slot availability.
+    through the self-service mobile app, then reviewed by staff.
+
+    Phase: Advanced Doctor Schedule & Leave Management — an *approved* leave
+    now blocks booking (BookingService, AppointmentSerializer) and empties
+    slot generation (DoctorSlotsView, DoctorSmartSlotsView) for its date
+    range, via appointments.services.is_doctor_on_leave(). Pending/rejected
+    leaves have no scheduling effect. Still does not feed into the queue
+    (queue ETA is computed from existing Appointment rows only).
 
     Deliberately no leave-balance tracking here — that belongs to a future
     dedicated leave-policy system rather than hardcoded per-type totals.

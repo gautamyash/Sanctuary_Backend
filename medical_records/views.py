@@ -24,6 +24,7 @@ from .models import (
     MedicalVisit,
     PatientRecord,
     Prescription,
+    VitalSigns,
 )
 from .serializers import (
     AllergySerializer,
@@ -35,8 +36,10 @@ from .serializers import (
     MedicationWriteSerializer,
     DoctorNotesSerializer,
     PatientRecordSerializer,
+    PatientRecordUpdateSerializer,
     PrescriptionSerializer,
     PrescriptionWriteSerializer,
+    VitalSignsSerializer,
 )
 from .services import MedicalTimelineService
 
@@ -156,6 +159,40 @@ class VisitPrescriptionView(APIView):
         )
 
 
+class PrescriptionDetailView(APIView):
+    """PATCH/DELETE /api/records/prescriptions/{id}/ — admin/staff edit or
+    removal of a single prescription line (Phase: Admin Prescription
+    Management). Gated on "emr.prescription" — the same permission
+    VisitPrescriptionView's create already requires, reused rather than
+    switching to "emr.edit" so prescription writes stay under one
+    resource-specific permission end to end.
+
+    Mirrors AllergyDetailView/MedicationDetailView's exact pattern: PATCH
+    reuses PrescriptionWriteSerializer (the same serializer
+    VisitPrescriptionView already uses for input) with `partial=True`, and
+    DELETE is a plain removal. A Prescription is a leaf row under a
+    MedicalVisit — unlike the visit itself, deleting one doesn't cascade
+    into destroying any other clinical record, so it fits the same
+    business rules as Allergy/Medication delete."""
+
+    permission_classes = [PermissionRequired]
+    permission_code = "emr.prescription"
+
+    def patch(self, request, pk):
+        prescription = get_object_or_404(Prescription, pk=pk)
+        serializer = PrescriptionWriteSerializer(
+            prescription, data=request.data, partial=True
+        )
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        return Response(PrescriptionSerializer(prescription).data)
+
+    def delete(self, request, pk):
+        prescription = get_object_or_404(Prescription, pk=pk)
+        prescription.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
 class VisitReportUploadView(APIView):
     """POST /api/records/visits/{id}/reports/ — multipart lab-report upload.
 
@@ -179,6 +216,110 @@ class VisitReportUploadView(APIView):
             LabReportSerializer(report, context={"request": request}).data,
             status=status.HTTP_201_CREATED,
         )
+
+
+class LabReportDetailView(APIView):
+    """PATCH/DELETE /api/records/reports/{id}/ — admin/staff edit or removal
+    of a single lab report (Phase: Admin Lab Report Management).
+
+    LabReport only has title/file/uploaded_at/uploaded_by as real fields —
+    there is no test_name, status, ordered_date, result_date, or summary
+    concept anywhere in the schema, so none of those are invented here.
+    PATCH reuses LabReportSerializer (the same serializer
+    VisitReportUploadView's response already uses) with `partial=True`;
+    since `id`/`file_url`/`uploaded_at` are all read-only on that serializer
+    (pk, a SerializerMethodField, and an auto_now_add field respectively),
+    this naturally restricts editing to `title` only — no separate write
+    serializer needed, and no risk of silently accepting fields the model
+    doesn't support.
+
+    Edit is gated on "emr.edit" (the same general EMR-edit permission used
+    by Allergy/Medication/Visit-notes edits) rather than "emr.upload" —
+    "emr.upload" is granted to the Lab Technician role specifically for
+    *creating* reports, and editing report metadata afterward is a broader
+    EMR-edit action, not a re-upload.
+
+    Delete is gated on "emr.delete" ("Delete EMR Records") — a permission
+    code that already exists in the RBAC seed data but was not yet used by
+    any view. A LabReport is a leaf row under a MedicalVisit (its FK is not
+    unique, so a visit can have many reports, and removing one doesn't
+    cascade into destroying any other clinical record), so it fits the same
+    business rules as Prescription/Allergy/Medication delete. Using the
+    dedicated "emr.delete" code instead of "emr.edit" or "emr.upload" keeps
+    deleting an uploaded medical document — arguably a more sensitive action
+    than editing its title — under its own, already-provisioned permission
+    rather than folding it into a broader one."""
+
+    def get_permissions(self):
+        self.permission_code = (
+            "emr.delete" if self.request.method == "DELETE" else "emr.edit"
+        )
+        return [PermissionRequired()]
+
+    def patch(self, request, pk):
+        report = get_object_or_404(LabReport, pk=pk)
+        serializer = LabReportSerializer(
+            report, data=request.data, partial=True, context={"request": request}
+        )
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        return Response(serializer.data)
+
+    def delete(self, request, pk):
+        report = get_object_or_404(LabReport, pk=pk)
+        report.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+class VisitVitalsView(APIView):
+    """PATCH /api/records/visits/{id}/vitals/ — admin/staff edit (and,
+    implicitly, first-time creation) of a visit's vital signs (Phase: Admin
+    Vital Signs Management).
+
+    VitalSigns has a `OneToOneField` to MedicalVisit (unlike Prescription/
+    LabReport's plain FK) — at most one row per visit, and nothing
+    auto-creates it (no signal, unlike MedicalVisit's own auto-creation on
+    appointment completion). So a visit may exist with zero VitalSigns rows.
+    This endpoint reuses the same get-or-create shape `_record_for()`
+    already established for PatientRecord (another OneToOneField-adjacent,
+    not-auto-created resource): `VitalSigns.objects.get_or_create(
+    medical_visit=visit)`, then updates via the existing VitalSignsSerializer
+    with `partial=True`. This is deliberately the *only* endpoint — it covers
+    both "Create" and "Edit" in one action, which is exactly what the phase
+    requirements ask for ("if VitalSigns are auto-created or one-to-one,
+    reuse that flow instead of creating duplicates"): a separate create
+    endpoint would only risk attempting a second row, which the
+    OneToOneField would reject anyway.
+
+    Gated on "emr.edit" — the same general EMR-edit permission already used
+    by Allergy/Medication/Visit-notes/LabReport-title edits. There is no
+    vitals-specific RBAC code, and this isn't a distinct enough action to
+    warrant one.
+
+    No BMI field is exposed or invented: BMI does not exist on VitalSigns at
+    all — it is only a derived property on the unrelated PatientRecord model
+    (computed from that model's own height_cm/weight_kg there, a
+    patient-level record, not a per-visit one).
+
+    No DELETE: every field on VitalSigns is nullable/blank-friendly, so
+    clearing a visit's vitals is already fully achievable through this same
+    PATCH (send nulls/blank values). A dedicated delete would only differ in
+    removing the row itself rather than zeroing its values — a distinction
+    the requirements don't call for. Unlike Prescription/LabReport (leaf
+    rows with siblings on the same visit), VitalSigns is a singleton per
+    visit, so "deleting one of several" doesn't apply here the way it does
+    for those resources. Reported rather than implemented."""
+
+    permission_classes = [PermissionRequired]
+    permission_code = "emr.edit"
+
+    def patch(self, request, pk):
+        visit = get_object_or_404(MedicalVisit, pk=pk)
+        vitals, _ = VitalSigns.objects.get_or_create(medical_visit=visit)
+        serializer = VitalSignsSerializer(vitals, data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        return Response(serializer.data)
 
 
 class AllergyCreateView(APIView):
@@ -209,6 +350,102 @@ class MedicationCreateView(APIView):
         )
 
 
+# --------------------------------------------------------------------------- #
+# Admin/staff Allergy + Medication CRUD (Phase: Admin Patient Clinical
+# Management). AllergyCreateView/MedicationCreateView above are self-service
+# only — they resolve the record from `request.user`, so they can never be
+# used by an admin managing a *different* patient's record, and neither
+# resource had any edit or delete endpoint at all. These views are the
+# admin-scoped counterpart, mirroring PatientRecordDetailView's own pattern
+# (per-method "emr.edit" gate, `_record_for()` for the create side, the same
+# AllergySerializer/AllergyWriteSerializer and MedicationSerializer/
+# MedicationWriteSerializer pairs already used by the self-service views
+# above). No new model fields, no new serializers, no duplicated CRUD — the
+# self-service endpoints are untouched and keep serving the mobile app.
+# --------------------------------------------------------------------------- #
+class PatientAllergyCreateView(APIView):
+    """POST /api/records/patients/{patient_id}/allergies/ — admin/staff adds
+    an allergy to a specific patient's record. Gated on "emr.edit"."""
+
+    permission_classes = [PermissionRequired]
+    permission_code = "emr.edit"
+
+    def post(self, request, patient_id):
+        patient = get_object_or_404(User, pk=patient_id)
+        record = _record_for(patient)
+        serializer = AllergyWriteSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        allergy = serializer.save(patient_record=record)
+        track("allergy_added", allergy=allergy.id)
+        return Response(
+            AllergySerializer(allergy).data, status=status.HTTP_201_CREATED
+        )
+
+
+class AllergyDetailView(APIView):
+    """PATCH/DELETE /api/records/allergies/{id}/ — admin/staff edit or
+    removal of a single allergy entry. Gated on "emr.edit". PATCH reuses
+    AllergyWriteSerializer (the same serializer AllergyCreateView/
+    PatientAllergyCreateView already use for input), just with
+    `partial=True` for edits."""
+
+    permission_classes = [PermissionRequired]
+    permission_code = "emr.edit"
+
+    def patch(self, request, pk):
+        allergy = get_object_or_404(Allergy, pk=pk)
+        serializer = AllergyWriteSerializer(allergy, data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        return Response(AllergySerializer(allergy).data)
+
+    def delete(self, request, pk):
+        allergy = get_object_or_404(Allergy, pk=pk)
+        allergy.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+class PatientMedicationCreateView(APIView):
+    """POST /api/records/patients/{patient_id}/medications/ — admin/staff
+    adds a medication to a specific patient's record. Gated on "emr.edit"."""
+
+    permission_classes = [PermissionRequired]
+    permission_code = "emr.edit"
+
+    def post(self, request, patient_id):
+        patient = get_object_or_404(User, pk=patient_id)
+        record = _record_for(patient)
+        serializer = MedicationWriteSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        medication = serializer.save(patient_record=record)
+        track("medication_added", medication=medication.id)
+        return Response(
+            MedicationSerializer(medication).data, status=status.HTTP_201_CREATED
+        )
+
+
+class MedicationDetailView(APIView):
+    """PATCH/DELETE /api/records/medications/{id}/ — admin/staff edit or
+    removal of a single medication entry. Gated on "emr.edit"."""
+
+    permission_classes = [PermissionRequired]
+    permission_code = "emr.edit"
+
+    def patch(self, request, pk):
+        medication = get_object_or_404(Medication, pk=pk)
+        serializer = MedicationWriteSerializer(
+            medication, data=request.data, partial=True
+        )
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        return Response(MedicationSerializer(medication).data)
+
+    def delete(self, request, pk):
+        medication = get_object_or_404(Medication, pk=pk)
+        medication.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
 class TimelineView(APIView):
     """GET /api/records/timeline/ — the caller's clinical timeline.
 
@@ -227,19 +464,46 @@ class TimelineView(APIView):
 
 
 class PatientRecordDetailView(APIView):
-    """GET /api/records/patients/{patient_id}/ — a specific patient's health
-    record, for staff. Requires "emr.view".
+    """GET   /api/records/patients/{patient_id}/ — a specific patient's health
+                                                     record, for staff.
+    PATCH /api/records/patients/{patient_id}/ — admin/staff edit of that
+                                                  record's editable fields.
 
-    Reuses PatientRecordSerializer and the existing _record_for() helper, so it
-    behaves exactly like /api/records/me/ but for an explicit patient.
+    GET requires "emr.view" (unchanged); PATCH requires "emr.edit" — the
+    same per-method permission_code switch already used by UserListView/
+    UserDetailView in the authorization app, reused rather than reinvented.
+
+    Both reuse PatientRecordSerializer and the existing _record_for() helper
+    (get-or-create, never 404s even if the record hasn't been touched yet),
+    so PATCH behaves exactly like GET for locating the record, just with a
+    write afterward. PATCH is deliberately scoped to whatever
+    PatientRecordUpdateSerializer exposes today (blood_group only) — see
+    that serializer for how to extend it later.
     """
 
     permission_classes = [PermissionRequired]
-    permission_code = "emr.view"
+
+    def get_permissions(self):
+        self.permission_code = (
+            "emr.view" if self.request.method == "GET" else "emr.edit"
+        )
+        return [PermissionRequired()]
 
     def get(self, request, patient_id):
         patient = get_object_or_404(User, pk=patient_id)
         record = _record_for(patient)
+        return Response(
+            PatientRecordSerializer(record, context={"request": request}).data
+        )
+
+    def patch(self, request, patient_id):
+        patient = get_object_or_404(User, pk=patient_id)
+        record = _record_for(patient)
+        serializer = PatientRecordUpdateSerializer(
+            record, data=request.data, partial=True
+        )
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
         return Response(
             PatientRecordSerializer(record, context={"request": request}).data
         )

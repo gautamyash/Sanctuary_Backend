@@ -6,8 +6,8 @@ class DoctorQueueState(models.Model):
 
     One row per (doctor, date). Rebuilt by QueueService.recalculate_queue
     on every queue lifecycle event (check-in, start, complete, cancel,
-    reschedule). This is a pure read/derived layer over Appointment data —
-    it never feeds back into booking or scheduling.
+    no-show, reschedule). This is a pure read/derived layer over Appointment
+    data — it never feeds back into booking or scheduling.
     """
 
     doctor = models.ForeignKey(

@@ -1,6 +1,7 @@
 from django.urls import path
 
 from .views import (
+    AppointmentNoShowView,
     CheckInView,
     ConsultationStartView,
     DoctorQueueView,
@@ -18,6 +19,11 @@ urlpatterns = [
         "appointments/<int:pk>/start/",
         ConsultationStartView.as_view(),
         name="appointment-start",
+    ),
+    path(
+        "appointments/<int:pk>/no-show/",
+        AppointmentNoShowView.as_view(),
+        name="appointment-no-show",
     ),
     path(
         "appointments/<int:pk>/queue-status/",

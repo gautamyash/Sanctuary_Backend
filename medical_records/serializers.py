@@ -85,6 +85,16 @@ class MedicalVisitSerializer(serializers.ModelSerializer):
     reports = LabReportSerializer(many=True, read_only=True)
     date = serializers.DateField(source="appointment.date", read_only=True)
     time = serializers.TimeField(source="appointment.time", read_only=True)
+    # Phase: Admin Medical Visit Management — visit_type and status live on
+    # the related Appointment, not on MedicalVisit itself (no such fields
+    # exist on this model, and none are added here); these two read-only
+    # fields just surface what already exists there, the same way
+    # date/time above already do, so the Admin Panel's Medical Visits card
+    # can show "Visit Type" and "Status" without inventing any schema.
+    visit_type = serializers.CharField(
+        source="appointment.visit_type.name", read_only=True, default=None
+    )
+    status = serializers.CharField(source="appointment.status", read_only=True)
     # Doctor-only internal documentation: visible to the visit's own
     # patient (existing behavior, unchanged) or to a user holding
     # "emr.edit"; hidden otherwise.
@@ -99,6 +109,8 @@ class MedicalVisitSerializer(serializers.ModelSerializer):
             "doctor_detail",
             "date",
             "time",
+            "visit_type",
+            "status",
             "chief_complaint",
             "diagnosis",
             "clinical_notes",
@@ -174,6 +186,30 @@ class PatientRecordSerializer(serializers.ModelSerializer):
 
 
 # ---- write serializers ---------------------------------------------------- #
+
+
+class PatientRecordUpdateSerializer(serializers.ModelSerializer):
+    """Input for PATCH /api/records/patients/{patient_id}/ (admin/staff edit,
+    gated on "emr.edit"). Phase: Admin Patient Edit workflow — extended from
+    `blood_group`-only to every PatientRecord field the Admin Panel's Edit
+    Patient dialog needs, all of which already existed on the model and were
+    already readable via PatientRecordSerializer; this only makes them
+    writable here too. No schema change, no new endpoint. `bmi` stays
+    excluded — it's derived (PatientRecord.save() computes it from
+    height_cm/weight_kg) and read-only everywhere, including here."""
+
+    class Meta:
+        model = PatientRecord
+        fields = (
+            "blood_group",
+            "height_cm",
+            "weight_kg",
+            "smoking_status",
+            "alcohol",
+            "pregnant",
+            "emergency_contact",
+        )
+        extra_kwargs = {f: {"required": False} for f in fields}
 
 
 class DoctorNotesSerializer(serializers.ModelSerializer):

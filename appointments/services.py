@@ -75,6 +75,81 @@ class BookingService:
             cls._create_prediction(appointment, booking)
             return appointment
 
+    @classmethod
+    def reschedule(
+        cls,
+        appointment,
+        *,
+        doctor=None,
+        date,
+        time,
+        estimated_duration=None,
+        visit_type=None,
+        reason=None,
+    ):
+        """Move `appointment` to a new doctor/date/time in place (Phase:
+        Appointment Rescheduling) — the same row, same id, so its history,
+        any Billing invoice/payment linked to it, and its
+        AppointmentDurationPrediction snapshot all stay attached exactly as
+        they are. Not a cancel+create: this never creates a new Appointment
+        or a new prediction row.
+
+        Reuses the exact lock + _is_booking_allowed check book() uses, with
+        the appointment's own current row excluded from the overlap check
+        via exclude_id (it is moving, not double-booking itself)."""
+        doctor = doctor or appointment.doctor
+        duration = (
+            estimated_duration
+            or appointment.estimated_duration
+            or (visit_type.default_duration if visit_type else None)
+            or 30
+        )
+
+        booking = {
+            "patient": appointment.patient,
+            "doctor": doctor,
+            "date": date,
+            "time": time,
+            "estimated_duration": duration,
+        }
+        cls._validate_booking(booking)
+
+        with transaction.atomic():
+            lock = cls._get_booking_lock(doctor, date)
+            lock = DoctorDayBookingLock.objects.select_for_update().get(pk=lock.pk)
+            if not cls._is_booking_allowed(booking, exclude_id=appointment.id):
+                raise BookingConflict
+
+            appointment.doctor = doctor
+            appointment.date = date
+            appointment.time = time
+            appointment.estimated_duration = duration
+            if visit_type is not None:
+                appointment.visit_type = visit_type
+            if reason is not None:
+                appointment.reason = reason
+            # The old timestamp belonged to the previous slot; CheckInView
+            # requires date == today and not-yet-checked-in, so a stale
+            # check-in from the old date must not block checking in for the
+            # new one.
+            appointment.patient_checked_in_at = None
+            try:
+                appointment.save(
+                    update_fields=[
+                        "doctor",
+                        "date",
+                        "time",
+                        "estimated_duration",
+                        "visit_type",
+                        "reason",
+                        "patient_checked_in_at",
+                        "updated_at",
+                    ]
+                )
+            except IntegrityError as exc:
+                raise BookingConflict from exc
+            return appointment
+
     @staticmethod
     def _prepare_booking(
         *,
@@ -126,15 +201,31 @@ class BookingService:
         return DoctorDayBookingLock.objects.get_or_create(doctor=doctor, date=date)[0]
 
     @staticmethod
-    def _is_booking_allowed(booking):
+    def _is_booking_allowed(booking, exclude_id=None):
         doctor = booking["doctor"]
         day = booking["date"]
         start_time = booking["time"]
         duration = booking["estimated_duration"]
 
+        # Single authoritative check: every booking path funnels through
+        # book() -> _is_booking_allowed (self-service, admin follow-up
+        # booking, and WaitlistAcceptView, which calls BookingService.book()
+        # directly and never passes through AppointmentSerializer.validate()).
+        # So this is where an approved leave must be enforced to actually be
+        # airtight, not just at the serializer layer.
+        #
+        # exclude_id (Phase: Appointment Rescheduling) — only ever passed by
+        # reschedule(), so the appointment being moved never registers as a
+        # conflict with its own current slot. book()'s call site below never
+        # passes it, so nothing changes for fresh bookings.
+        if is_doctor_on_leave(doctor, day):
+            return False
         if not within_working_hours(doctor, day, start_time, duration):
             return False
-        return find_overlap(doctor, day, start_time, duration) is None
+        return (
+            find_overlap(doctor, day, start_time, duration, exclude_id=exclude_id)
+            is None
+        )
 
     @staticmethod
     def _create_booking(booking):
@@ -187,6 +278,96 @@ def within_working_hours(doctor, day, start_time, minutes: int) -> bool:
         if start_dt >= block_start and end_dt <= block_end:
             return True
     return False
+
+
+def is_doctor_on_leave(doctor, day) -> bool:
+    """True if `doctor` has an *approved* DoctorLeave covering `day`
+    (Phase: Advanced Doctor Schedule & Leave Management).
+
+    Only approved leaves block scheduling — pending/rejected leaves have
+    no scheduling effect, matching the existing staff-approval workflow
+    already on DoctorLeave.status (a leave a doctor merely *requested*
+    shouldn't silently close their calendar before anyone reviews it).
+
+    Imports DoctorLeave lazily, mirroring the existing cross-app import
+    convention already used elsewhere (e.g. doctors/views.py importing
+    from appointments.services inside method bodies) rather than a
+    module-level import, since `doctors` has no reason to otherwise
+    depend on `appointments` at import time.
+
+    Reused by every booking/slot-generation call site (BookingService.
+    _is_booking_allowed, AppointmentSerializer.validate, DoctorSlotsView,
+    DoctorSmartSlotsView) so they all agree on exactly what "on leave"
+    means — the same way find_overlap/within_working_hours are already
+    shared across those same call sites, rather than each reimplementing
+    its own leave check."""
+    from doctors.models import DoctorLeave
+
+    return DoctorLeave.objects.filter(
+        doctor=doctor,
+        status=DoctorLeave.Status.APPROVED,
+        start_date__lte=day,
+        end_date__gte=day,
+    ).exists()
+
+
+def handle_leave_conflicts(leave) -> list:
+    """When a DoctorLeave transitions to approved, any appointment already
+    booked before the leave existed/was reviewed can now fall inside the
+    doctor's blocked date range — is_doctor_on_leave() only stops *new*
+    bookings, it doesn't retroactively touch ones made earlier, so without
+    this the doctor's calendar and the booking stay silently out of sync.
+
+    Reuses the exact same cancellation side-effects AppointmentCancelView
+    already uses (free the slot to the waitlist via auto_fill_slot,
+    recalculate that day's queue) rather than a second cancellation path,
+    plus a dedicated notification so the patient knows why. A consultation
+    already in progress is left alone, mirroring the same guard
+    AppointmentRescheduleView uses, since a leave doesn't undo a visit
+    that's already happening.
+
+    Called from doctors/views.py (both the direct-create-as-approved and
+    approve-via-update paths) with a lazy import back into this module, the
+    same cross-app convention is_doctor_on_leave()'s docstring documents.
+
+    Returns the list of cancelled appointments."""
+    conflicts = list(
+        Appointment.objects.filter(
+            doctor=leave.doctor,
+            date__gte=leave.start_date,
+            date__lte=leave.end_date,
+            status__in=Appointment.ACTIVE_STATUSES,
+            consultation_started_at__isnull=True,
+        ).select_related("doctor", "patient")
+    )
+    if not conflicts:
+        return []
+
+    from queues.services import QueueService
+
+    affected_dates = set()
+    for appointment in conflicts:
+        appointment.status = Appointment.Status.CANCELLED
+        appointment.save(update_fields=["status", "updated_at"])
+        affected_dates.add(appointment.date)
+
+        auto_fill_slot(
+            appointment.doctor,
+            appointment.date,
+            appointment.time,
+            appointment.estimated_duration or 30,
+        )
+        NotificationService.send_appointment_cancelled_leave(appointment)
+        track(
+            "appointment_cancelled_leave",
+            appointment=appointment.id,
+            leave=leave.id,
+        )
+
+    for d in affected_dates:
+        QueueService.recalculate_queue(leave.doctor, d)
+
+    return conflicts
 
 
 def active_intervals(doctor, day, exclude_id=None):

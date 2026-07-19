@@ -5,8 +5,10 @@ from django.utils.encoding import force_bytes, force_str
 from django.utils.http import urlsafe_base64_decode, urlsafe_base64_encode
 from rest_framework import generics, permissions, status
 from rest_framework.response import Response
+from rest_framework.throttling import ScopedRateThrottle
 from rest_framework.views import APIView
 from rest_framework_simplejwt.tokens import RefreshToken
+from rest_framework_simplejwt.views import TokenObtainPairView
 
 from .serializers import (
     PasswordResetConfirmSerializer,
@@ -19,11 +21,33 @@ from .serializers import (
 User = get_user_model()
 
 
+class ThrottledTokenObtainPairView(TokenObtainPairView):
+    """POST /api/auth/token/ — identical to simplejwt's stock
+    TokenObtainPairView (same request/response shape, same auth logic); adds
+    only a per-client rate limit (Production hardening) so repeated
+    login attempts from one client are capped, mitigating credential-
+    stuffing/brute-force. Rate is deliberately generous (comfortably above
+    the ~10 real login calls the existing authorization test suite makes
+    across a single shared anonymous-IP throttle bucket) so it cannot
+    interfere with any existing passing test; see DEFAULT_THROTTLE_RATES
+    in settings for the actual value."""
+
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = "login"
+
+
 class RegisterView(generics.CreateAPIView):
-    """POST name/email/password → creates account and returns JWT pair."""
+    """POST name/email/password → creates account and returns JWT pair.
+
+    Rate-limited (Production hardening) — the last of the public,
+    unauthenticated account endpoints without a limit: without one this can
+    be used for automated mass account creation. Same isolated-scope
+    technique as login/password-reset."""
 
     serializer_class = RegisterSerializer
     permission_classes = [permissions.AllowAny]
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = "register"
 
     def create(self, request, *args, **kwargs):
         serializer = self.get_serializer(data=request.data)
@@ -66,9 +90,17 @@ class PasswordResetRequestView(APIView):
     matches an account, to avoid leaking which emails are registered. If it
     does match, emails a reset link containing uid + token (uses Django's
     EMAIL_BACKEND — console backend in dev, real SMTP once configured via
-    environment variables in production)."""
+    environment variables in production).
+
+    Rate-limited (Production hardening) — this is a fully public, unauth-
+    enticated endpoint that triggers an email side-effect for any existing
+    account, so without a limit it can be used to spam a real user's inbox
+    with reset emails. Same technique as the login endpoint's throttle, on
+    its own scope so it never shares a bucket with anything else."""
 
     permission_classes = [permissions.AllowAny]
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = "password_reset_request"
 
     def post(self, request):
         serializer = PasswordResetRequestSerializer(data=request.data)
@@ -100,9 +132,17 @@ class PasswordResetRequestView(APIView):
 
 
 class PasswordResetConfirmView(APIView):
-    """POST /api/auth/password-reset/confirm/ {uid, token, new_password}"""
+    """POST /api/auth/password-reset/confirm/ {uid, token, new_password}
+
+    Rate-limited (Production hardening) — this is the other half of the
+    password-reset flow's public, unauthenticated surface: without a limit,
+    the {uid, token} pair could be brute-forced or hammered at high volume.
+    Same technique and isolation as the request endpoint's throttle, on its
+    own scope."""
 
     permission_classes = [permissions.AllowAny]
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = "password_reset_confirm"
 
     def post(self, request):
         serializer = PasswordResetConfirmSerializer(data=request.data)

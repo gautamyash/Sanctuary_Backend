@@ -138,7 +138,14 @@ class DoctorLeaveListCreateView(generics.ListCreateAPIView):
 
     def perform_create(self, serializer):
         doctor = get_object_or_404(Doctor, pk=self.kwargs["doctor_id"])
-        serializer.save(doctor=doctor)
+        leave = serializer.save(doctor=doctor)
+        if leave.status == DoctorLeave.Status.APPROVED:
+            # A leave can be created already-approved in one step (this
+            # serializer's `status` is writable) rather than only reaching
+            # approved via a later PATCH — same conflict handling either way.
+            from appointments.services import handle_leave_conflicts
+
+            handle_leave_conflicts(leave)
 
 
 class DoctorLeaveDetailView(generics.RetrieveUpdateDestroyAPIView):
@@ -157,14 +164,24 @@ class DoctorLeaveDetailView(generics.RetrieveUpdateDestroyAPIView):
         return DoctorLeave.objects.filter(doctor_id=self.kwargs["doctor_id"])
 
     def perform_update(self, serializer):
-        if "status" in serializer.validated_data and serializer.validated_data[
-            "status"
-        ] != serializer.instance.status:
+        status_changed = (
+            "status" in serializer.validated_data
+            and serializer.validated_data["status"] != serializer.instance.status
+        )
+        if status_changed:
             from django.utils import timezone
 
-            serializer.save(
+            leave = serializer.save(
                 approved_by=self.request.user, approved_at=timezone.now()
             )
+            if leave.status == DoctorLeave.Status.APPROVED:
+                # Newly approved — any appointment already booked in this
+                # date range is now a conflict; cancel it the same way
+                # AppointmentCancelView does (waitlist auto-fill + queue
+                # recalculation), just triggered from the leave side.
+                from appointments.services import handle_leave_conflicts
+
+                handle_leave_conflicts(leave)
         else:
             serializer.save()
 
@@ -180,7 +197,11 @@ class DoctorSlotsView(APIView):
     permission_classes = [permissions.AllowAny]
 
     def get(self, request, pk):
-        from appointments.services import active_intervals, intervals_overlap
+        from appointments.services import (
+            active_intervals,
+            intervals_overlap,
+            is_doctor_on_leave,
+        )
 
         doctor = get_object_or_404(Doctor, pk=pk, is_active=True)
         date_str = request.query_params.get("date")
@@ -192,6 +213,14 @@ class DoctorSlotsView(APIView):
             )
         except ValueError:
             return Response({"detail": "Invalid date, use YYYY-MM-DD."}, status=400)
+
+        # Phase: Advanced Doctor Schedule & Leave Management — an approved
+        # leave covering this date means there is nothing to offer, no
+        # matter what the weekly schedule says. Additive "on_leave" flag;
+        # the existing "slots" contract is unchanged (just empty) so no
+        # existing consumer of this endpoint breaks.
+        if is_doctor_on_leave(doctor, day):
+            return Response({"date": day.isoformat(), "slots": [], "on_leave": True})
 
         schedules = doctor.schedules.filter(weekday=day.weekday())
         # Same interval-overlap engine used by smart-slots and booking
@@ -232,7 +261,7 @@ class DoctorSmartSlotsView(APIView):
     permission_classes = [permissions.AllowAny]
 
     def get(self, request, pk):
-        from appointments.services import generate_smart_slots
+        from appointments.services import generate_smart_slots, is_doctor_on_leave
 
         doctor = get_object_or_404(Doctor, pk=pk, is_active=True)
         date_str = request.query_params.get("date")
@@ -250,6 +279,20 @@ class DoctorSmartSlotsView(APIView):
         except ValueError:
             return Response({"detail": "duration must be a number."}, status=400)
         duration = max(5, min(240, duration))
+
+        # Phase: Advanced Doctor Schedule & Leave Management — same
+        # short-circuit as DoctorSlotsView above: an approved leave means no
+        # slots at all that day, regardless of the weekly schedule.
+        if is_doctor_on_leave(doctor, day):
+            return Response(
+                {
+                    "date": day.isoformat(),
+                    "duration": duration,
+                    "slots": [],
+                    "booked": [],
+                    "on_leave": True,
+                }
+            )
 
         free, booked = generate_smart_slots(doctor, day, duration)
         return Response(

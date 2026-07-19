@@ -11,21 +11,35 @@ architecture requirement: "Do NOT duplicate profile creation logic.
 Centralize profile creation inside a service/factory. User creation should
 simply call that service.").
 
-Supported roles today: only "Doctor" has a real linked profile model
+Supported roles today: "Doctor" has a real linked profile model
 (`doctors.Doctor`, which already carries a nullable `user` OneToOneField
 from the earlier Doctor self-service mobile app phase). Receptionist,
 Nurse, Pharmacist, and Lab Technician have no profile model anywhere in
-this codebase yet — per the phase spec ("create ... profile if available
-... otherwise prepare the infrastructure without changing existing
-behavior"), those roles are registered with no-op provisioners below.
-Adding a real profile model for one of them later is exactly one new
-registry entry here, not a rewrite of this service or its call sites.
+this codebase yet — per that phase's spec ("create ... profile if
+available ... otherwise prepare the infrastructure without changing
+existing behavior"), those roles are registered with no-op provisioners
+below. Adding a real profile model for one of them later is exactly one
+new registry entry here, not a rewrite of this service or its call sites.
+
+"Patient" (Phase: Backend Patient Creation API) reuses the exact same
+`PatientRecord.objects.get_or_create(patient=user)` pattern already used by
+`medical_records.views._record_for()` for lazily creating a patient's
+record the first time any /api/records/ endpoint is hit for them. Wiring it
+into this registry means an Admin-created Patient gets their (empty)
+PatientRecord immediately at creation time instead of lazily on first
+access — the row shape and get_or_create semantics are identical either
+way, so nothing about the existing lazy path (self-registration via
+RegisterView, or any patient's first /api/records/me/ call) changes.
+PatientRecord has no `is_active`/soft-delete concept — it is a passive
+clinical-data extension of the User row, not a directory entry — so it has
+no deactivator; a role change away from Patient leaves it untouched
+(medical history is never deleted).
 
 Doctor rows are NEVER deleted by this service, only deactivated
 (`is_active=False`) and reactivated. `medical_records.MedicalVisit.doctor`
 is `on_delete=CASCADE`, so deleting a Doctor row would silently destroy a
 patient's medical history — deactivating instead is not just a UX nicety
-here, it is the only safe option, matching the phase's explicit "Never
+here, it is the only safe option, matching that phase's explicit "Never
 delete medical history" requirement.
 """
 
@@ -33,6 +47,7 @@ from dataclasses import dataclass
 from typing import Callable, Optional
 
 from doctors.models import Doctor, Specialty
+from medical_records.models import PatientRecord
 
 
 @dataclass
@@ -110,11 +125,22 @@ def _deactivate_doctor(user) -> Optional[ProvisioningResult]:
     return ProvisioningResult("Doctor", "deactivated", doctor.id)
 
 
+def _provision_patient(user) -> ProvisioningResult:
+    """Create or reuse the PatientRecord linked to `user`. Identical
+    get_or_create() call to `medical_records.views._record_for()` — same
+    row, same semantics, just invoked at admin-creation time instead of
+    lazily on first /api/records/ access. `PatientRecord.patient` is a
+    OneToOneField, so `get_or_create` can never produce a duplicate."""
+    record, created = PatientRecord.objects.get_or_create(patient=user)
+    return ProvisioningResult("Patient", "created" if created else "reused", record.id)
+
+
 # Registry: role name -> provisioning function. A role with no entry here
 # has no linked profile concept at all in this codebase yet (Owner, Admin,
-# Accountant, Patient) and is silently skipped — not an error.
+# Accountant) and is silently skipped — not an error.
 _PROVISIONERS: dict[str, Callable] = {
     "Doctor": _provision_doctor,
+    "Patient": _provision_patient,
 }
 
 # Registry: role name -> deactivation function, mirroring _PROVISIONERS.

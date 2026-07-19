@@ -93,6 +93,7 @@ class AdminCreateUserSerializer(serializers.ModelSerializer):
             "email",
             "phone",
             "gender",
+            "date_of_birth",
             "password",
             "role",
             "is_active",
@@ -101,6 +102,7 @@ class AdminCreateUserSerializer(serializers.ModelSerializer):
         extra_kwargs = {
             "phone": {"required": False},
             "gender": {"required": False},
+            "date_of_birth": {"required": False},
         }
 
     def create(self, validated_data):
@@ -114,6 +116,7 @@ class AdminCreateUserSerializer(serializers.ModelSerializer):
             name=validated_data["name"],
             phone=validated_data.get("phone", ""),
             gender=validated_data.get("gender", ""),
+            date_of_birth=validated_data.get("date_of_birth"),
             is_active=is_active,
         )
 
@@ -167,11 +170,12 @@ class AdminUpdateUserSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = User
-        fields = ("name", "phone", "gender", "is_active", "role")
+        fields = ("name", "phone", "gender", "date_of_birth", "is_active", "role")
         extra_kwargs = {
             "name": {"required": False},
             "phone": {"required": False},
             "gender": {"required": False},
+            "date_of_birth": {"required": False},
             "is_active": {"required": False},
         }
 

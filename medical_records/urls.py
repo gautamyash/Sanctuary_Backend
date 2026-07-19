@@ -2,11 +2,17 @@ from django.urls import path
 
 from .views import (
     AllergyCreateView,
+    AllergyDetailView,
+    LabReportDetailView,
     MedicationCreateView,
+    MedicationDetailView,
+    PatientAllergyCreateView,
+    PatientMedicationCreateView,
     PatientRecordDetailView,
     PatientRecordMeView,
     PatientTimelineView,
     PatientVisitListView,
+    PrescriptionDetailView,
     RecordsAnalyticsView,
     TimelineView,
     VisitDetailView,
@@ -14,6 +20,7 @@ from .views import (
     VisitNotesView,
     VisitPrescriptionView,
     VisitReportUploadView,
+    VisitVitalsView,
 )
 
 urlpatterns = [
@@ -50,15 +57,50 @@ urlpatterns = [
         name="record-visit-prescriptions",
     ),
     path(
+        "records/prescriptions/<int:pk>/",
+        PrescriptionDetailView.as_view(),
+        name="record-prescription-detail",
+    ),
+    path(
         "records/visits/<int:pk>/reports/",
         VisitReportUploadView.as_view(),
         name="record-visit-reports",
+    ),
+    path(
+        "records/reports/<int:pk>/",
+        LabReportDetailView.as_view(),
+        name="record-report-detail",
+    ),
+    path(
+        "records/visits/<int:pk>/vitals/",
+        VisitVitalsView.as_view(),
+        name="record-visit-vitals",
     ),
     path("records/allergies/", AllergyCreateView.as_view(), name="record-allergies"),
     path(
         "records/medications/",
         MedicationCreateView.as_view(),
         name="record-medications",
+    ),
+    path(
+        "records/patients/<int:patient_id>/allergies/",
+        PatientAllergyCreateView.as_view(),
+        name="record-patient-allergies",
+    ),
+    path(
+        "records/allergies/<int:pk>/",
+        AllergyDetailView.as_view(),
+        name="record-allergy-detail",
+    ),
+    path(
+        "records/patients/<int:patient_id>/medications/",
+        PatientMedicationCreateView.as_view(),
+        name="record-patient-medications",
+    ),
+    path(
+        "records/medications/<int:pk>/",
+        MedicationDetailView.as_view(),
+        name="record-medication-detail",
     ),
     path("records/timeline/", TimelineView.as_view(), name="record-timeline"),
     path(

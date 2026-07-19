@@ -5,6 +5,7 @@ from .views import (
     AppointmentCancelView,
     AppointmentCompleteView,
     AppointmentListCreateView,
+    AppointmentRescheduleView,
     PredictDurationView,
     SchedulingAnalyticsView,
     VisitTypeListView,
@@ -29,6 +30,11 @@ urlpatterns = [
         "appointments/<int:pk>/complete/",
         AppointmentCompleteView.as_view(),
         name="appointment-complete",
+    ),
+    path(
+        "appointments/<int:pk>/reschedule/",
+        AppointmentRescheduleView.as_view(),
+        name="appointment-reschedule",
     ),
     path("visit-types/", VisitTypeListView.as_view(), name="visit-types"),
     path(

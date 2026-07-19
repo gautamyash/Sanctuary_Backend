@@ -21,7 +21,7 @@ Covers:
     and attendance now that those endpoints are RBAC-wrapped.
 """
 
-from datetime import time, timedelta
+from datetime import date, time, timedelta
 
 from django.core.exceptions import PermissionDenied as DjangoPermissionDenied
 from django.test import TestCase
@@ -38,7 +38,7 @@ from authorization.permissions import PermissionRequired
 from authorization.services import PermissionService
 from billing.models import Invoice
 from doctors.models import Doctor, DoctorSchedule, Specialty
-from medical_records.models import MedicalVisit
+from medical_records.models import MedicalVisit, PatientRecord
 
 # --------------------------------------------------------------------------- #
 # Expected seed state, hardcoded independently of the migration source so
@@ -614,6 +614,29 @@ class AdminCreateUserTests(Base):
         )
         self.assertEqual(resp.data["role"]["name"], "Nurse")
 
+    def test_create_accepts_optional_date_of_birth(self):
+        self._assign_role(self.patient, "Owner")
+        self.client.force_authenticate(self.patient)
+        resp = self.client.post(
+            reverse("user-list"),
+            self._payload(date_of_birth="1990-05-15"),
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 201)
+        created = User.objects.get(email="new.hire@example.com")
+        self.assertEqual(created.date_of_birth, date(1990, 5, 15))
+        self.assertEqual(resp.data["user"]["date_of_birth"], "1990-05-15")
+
+    def test_create_without_date_of_birth_defaults_to_none(self):
+        self._assign_role(self.patient, "Owner")
+        self.client.force_authenticate(self.patient)
+        resp = self.client.post(
+            reverse("user-list"), self._payload(), format="json"
+        )
+        self.assertEqual(resp.status_code, 201)
+        created = User.objects.get(email="new.hire@example.com")
+        self.assertIsNone(created.date_of_birth)
+
     def test_succeeds_for_superuser(self):
         self.client.force_authenticate(self.superuser)
         resp = self.client.post(
@@ -879,6 +902,33 @@ class AdminUpdateUserTests(Base):
         self.assertEqual(self.other.phone, "+1 555 9999")
         self.assertEqual(self.other.gender, "other")
         self.assertFalse(self.other.is_active)
+
+    def test_edit_updates_date_of_birth(self):
+        self._assign_role(self.patient, "Owner")
+        self.client.force_authenticate(self.patient)
+        resp = self.client.patch(
+            reverse("user-detail", args=[self.other.id]),
+            {"date_of_birth": "1985-11-02"},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.other.refresh_from_db()
+        self.assertEqual(self.other.date_of_birth, date(1985, 11, 2))
+        self.assertEqual(resp.data["user"]["date_of_birth"], "1985-11-02")
+
+    def test_edit_omitting_date_of_birth_leaves_it_unchanged(self):
+        self._assign_role(self.patient, "Owner")
+        self.other.date_of_birth = date(1985, 11, 2)
+        self.other.save(update_fields=["date_of_birth"])
+        self.client.force_authenticate(self.patient)
+        resp = self.client.patch(
+            reverse("user-detail", args=[self.other.id]),
+            {"name": "Still Same DOB"},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.other.refresh_from_db()
+        self.assertEqual(self.other.date_of_birth, date(1985, 11, 2))
 
     def test_email_is_not_editable(self):
         self._assign_role(self.patient, "Owner")
@@ -1231,14 +1281,144 @@ class AutomaticStaffProfileLinkingTests(Base):
             self.assertEqual(resp.status_code, 201, role_name)
             self.assertEqual(resp.data["profile_messages"], [], role_name)
 
-    def test_creating_patient_or_accountant_creates_no_doctor_profile(self):
-        for role_name, email in [
-            ("Patient", "patient.hire@example.com"),
-            ("Accountant", "acct.hire@example.com"),
-        ]:
-            resp = self._create_user(role_name, email=email)
-            self.assertEqual(resp.status_code, 201, role_name)
-            self.assertEqual(resp.data["profile_messages"], [], role_name)
+    def test_creating_accountant_creates_no_profile(self):
+        # Accountant has no linked profile concept at all (unlike Patient,
+        # which now provisions a PatientRecord below) — still no messages,
+        # still no Doctor row.
+        resp = self._create_user("Accountant", email="acct.hire@example.com")
+        self.assertEqual(resp.status_code, 201)
+        self.assertEqual(resp.data["profile_messages"], [])
+        created = User.objects.get(email="acct.hire@example.com")
+        self.assertFalse(Doctor.objects.filter(user=created).exists())
+
+    # --- Patient: PatientRecord provisioning (Phase: Backend Patient
+    # Creation API) -------------------------------------------------------
+
+    def test_creating_patient_user_creates_patient_record_immediately(self):
+        resp = self._create_user("Patient", email="new.patient@example.com")
+        self.assertEqual(resp.status_code, 201)
+        self.assertEqual(resp.data["profile_messages"], ["Patient profile created"])
+
+        created = User.objects.get(email="new.patient@example.com")
+        self.assertTrue(PatientRecord.objects.filter(patient=created).exists())
+        # No Doctor row is created for a Patient.
+        self.assertFalse(Doctor.objects.filter(user=created).exists())
+
+    def test_created_patient_record_is_empty_by_default(self):
+        self._create_user("Patient", email="new.patient@example.com")
+        created = User.objects.get(email="new.patient@example.com")
+        record = PatientRecord.objects.get(patient=created)
+        self.assertEqual(record.blood_group, "")
+        self.assertIsNone(record.height_cm)
+        self.assertIsNone(record.weight_kg)
+        self.assertEqual(record.emergency_contact, "")
+
+    def test_created_patient_can_authenticate_with_mobile_login_contract(self):
+        """Mirrors the mobile login contract: same JWT token endpoint the
+        native app's patient sign-in screen calls."""
+        resp = self._create_user("Patient", email="new.patient@example.com")
+        self.assertEqual(resp.status_code, 201)
+        self.client.force_authenticate(None)
+        token_resp = self.client.post(
+            reverse("token_obtain_pair"),
+            {"email": "new.patient@example.com", "password": "S3curePassw0rd!"},
+            format="json",
+        )
+        self.assertEqual(token_resp.status_code, 200)
+        self.assertIn("access", token_resp.data)
+
+    def test_created_patient_appears_in_patients_directory(self):
+        """Mirrors the Admin Panel's Patients page, which lists
+        GET /api/auth/users/?role=Patient."""
+        resp = self._create_user("Patient", email="new.patient@example.com")
+        self.assertEqual(resp.status_code, 201)
+        list_resp = self.client.get(reverse("user-list"), {"role": "Patient"})
+        self.assertEqual(list_resp.status_code, 200)
+        emails = {u["email"] for u in list_resp.data["results"]}
+        self.assertIn("new.patient@example.com", emails)
+
+    def test_role_change_to_patient_creates_record_if_missing(self):
+        self._create_user("Nurse", email="was.nurse@example.com")
+        target = User.objects.get(email="was.nurse@example.com")
+        self.assertFalse(PatientRecord.objects.filter(patient=target).exists())
+
+        patient_role = Role.objects.get(name="Patient")
+        patch_resp = self.client.patch(
+            reverse("user-detail", args=[target.id]),
+            {"role": patient_role.id},
+            format="json",
+        )
+        self.assertEqual(patch_resp.status_code, 200)
+        self.assertEqual(
+            patch_resp.data["profile_messages"], ["Patient profile created"]
+        )
+        self.assertEqual(PatientRecord.objects.filter(patient=target).count(), 1)
+
+    def test_reassigning_patient_role_reuses_record_without_duplicating(self):
+        self._create_user("Patient", email="new.patient@example.com")
+        target = User.objects.get(email="new.patient@example.com")
+        original_record = PatientRecord.objects.get(patient=target)
+
+        # Change away and back to Patient: exercises the reuse path.
+        nurse_role = Role.objects.get(name="Nurse")
+        self.client.patch(
+            reverse("user-detail", args=[target.id]),
+            {"role": nurse_role.id},
+            format="json",
+        )
+        patient_role = Role.objects.get(name="Patient")
+        patch_resp = self.client.patch(
+            reverse("user-detail", args=[target.id]),
+            {"role": patient_role.id},
+            format="json",
+        )
+        self.assertEqual(patch_resp.status_code, 200)
+        # "reused" is silent (no message) — nothing new happened.
+        self.assertEqual(patch_resp.data["profile_messages"], [])
+        self.assertEqual(PatientRecord.objects.filter(patient=target).count(), 1)
+        self.assertEqual(
+            PatientRecord.objects.get(patient=target).pk, original_record.pk
+        )
+
+    def test_role_change_away_from_patient_does_not_delete_record(self):
+        self._create_user("Patient", email="new.patient@example.com")
+        target = User.objects.get(email="new.patient@example.com")
+        record = PatientRecord.objects.get(patient=target)
+        record.blood_group = "O+"
+        record.save(update_fields=["blood_group"])
+
+        nurse_role = Role.objects.get(name="Nurse")
+        patch_resp = self.client.patch(
+            reverse("user-detail", args=[target.id]),
+            {"role": nurse_role.id},
+            format="json",
+        )
+        self.assertEqual(patch_resp.status_code, 200)
+        # Patient has no deactivator registered — the record (and its data)
+        # is left completely untouched, never deleted or wiped.
+        record.refresh_from_db()
+        self.assertEqual(record.blood_group, "O+")
+        self.assertTrue(PatientRecord.objects.filter(pk=record.pk).exists())
+
+    def test_existing_registration_flow_creates_no_eager_patient_record(self):
+        """Confirms self-registration (accounts.RegisterView, untouched by
+        this phase) still creates its PatientRecord lazily on first
+        /api/records/ access rather than eagerly at registration — this
+        phase only wires eager creation into the ADMIN creation path
+        (StaffProfileProvisioningService); RegisterSerializer/RegisterView
+        are not touched at all."""
+        resp = self.client.post(
+            reverse("register"),
+            {
+                "name": "Self Signup",
+                "email": "self.signup@example.com",
+                "password": "S3curePassw0rd!",
+            },
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 201)
+        new_user = User.objects.get(email="self.signup@example.com")
+        self.assertFalse(PatientRecord.objects.filter(patient=new_user).exists())
 
     # --- Role edit: Doctor -> Receptionist deactivates, never deletes ----
 

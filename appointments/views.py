@@ -1,5 +1,6 @@
 from datetime import datetime, timedelta
 
+from django.contrib.auth import get_user_model
 from django.db import transaction
 from django.db.models import Avg, Count, Q
 from django.shortcuts import get_object_or_404
@@ -33,6 +34,8 @@ from .services import (
     auto_fill_slot,
     expire_stale_offers,
 )
+
+User = get_user_model()
 
 SLOT_TAKEN = {"detail": "This slot was just booked by someone else."}
 
@@ -99,18 +102,41 @@ class AdminAppointmentListView(APIView):
     """GET /api/admin/appointments/ — all appointments across the hospital,
     for staff.
 
-    Filters: ?status= ?doctor=<id> ?date=YYYY-MM-DD ?date_from= ?date_to=
-    ?q= (patient or doctor name/email). Reuses AdminAppointmentSerializer
+    Filters: ?status= ?doctor=<id> ?patient=<id> ?date=YYYY-MM-DD ?date_from=
+    ?date_to= ?q= (patient or doctor name/email). Reuses AdminAppointmentSerializer
     (adds read-only patient identity). Requires "appointment.view". This is
     additive and does not alter the patient-scoped GET /api/appointments/ list.
+
+    ?patient= (Phase: Admin Medical Visit Management) lets the Admin Panel's
+    "Add Visit" flow list a specific patient's own appointments so staff can
+    pick one to complete — reusing this existing list rather than adding a
+    new patient-scoped appointments endpoint.
 
     Pagination (count/next/previous/results) is applied only when a page_size
     query param is supplied; otherwise the full {"results": [...]} list is
     returned, unchanged.
+
+    POST /api/admin/appointments/  {patient, doctor, date, time, visit_type?,
+    estimated_duration?, reason?} — staff books an appointment on behalf of a
+    specific patient (Phase: Admin Follow-up & Care Plan). Before this, no
+    endpoint in the system let staff book for someone else: the patient-facing
+    AppointmentListCreateView.create() hardcodes `patient=request.user`, so it
+    can only ever book for whoever is authenticated. This reuses that exact
+    same booking engine rather than writing a parallel one — AppointmentSerializer
+    validates doctor/date/time/visit_type/estimated_duration/reason (the same
+    validation, including working-hours and overlap checks, the patient-facing
+    view already runs), and BookingService.book() performs the same
+    locking/conflict-checked booking. The only difference is which user the
+    resulting Appointment belongs to. Gated on "appointment.create" — a
+    permission code already seeded in RBAC (granted to Doctor/Receptionist/
+    Admin/Owner) but not wired to any view until now.
     """
 
-    permission_classes = [PermissionRequired]
-    permission_code = "appointment.view"
+    def get_permissions(self):
+        self.permission_code = (
+            "appointment.create" if self.request.method == "POST" else "appointment.view"
+        )
+        return [PermissionRequired()]
 
     def get(self, request):
         qs = Appointment.objects.select_related(
@@ -121,6 +147,8 @@ class AdminAppointmentListView(APIView):
             qs = qs.filter(status=p["status"])
         if p.get("doctor"):
             qs = qs.filter(doctor_id=p["doctor"])
+        if p.get("patient"):
+            qs = qs.filter(patient_id=p["patient"])
         if p.get("date"):
             qs = qs.filter(date=p["date"])
         if p.get("date_from"):
@@ -150,6 +178,40 @@ class AdminAppointmentListView(APIView):
                     qs, many=True, context={"request": request}
                 ).data
             }
+        )
+
+    def post(self, request):
+        patient_id = request.data.get("patient")
+        if not patient_id:
+            return Response({"detail": "patient is required."}, status=400)
+        patient = get_object_or_404(User, pk=patient_id)
+
+        serializer = AppointmentSerializer(data=request.data)
+        try:
+            serializer.is_valid(raise_exception=True)
+        except DRFValidationError as exc:
+            if _conflict_codes(exc):
+                return Response(SLOT_TAKEN, status=status.HTTP_409_CONFLICT)
+            raise
+        source = serializer.validated_data.get("prediction_source", "rule_based")
+        confidence = serializer.validated_data.get("prediction_confidence", 0.8)
+        try:
+            appointment = BookingService.book(
+                patient=patient,
+                doctor=serializer.validated_data["doctor"],
+                date=serializer.validated_data["date"],
+                time=serializer.validated_data["time"],
+                visit_type=serializer.validated_data.get("visit_type"),
+                estimated_duration=serializer.validated_data.get("estimated_duration"),
+                source=source,
+                prediction_confidence=confidence,
+                reason=serializer.validated_data.get("reason", ""),
+            )
+        except BookingConflict:
+            return Response(SLOT_TAKEN, status=status.HTTP_409_CONFLICT)
+        return Response(
+            AdminAppointmentSerializer(appointment, context={"request": request}).data,
+            status=status.HTTP_201_CREATED,
         )
 
 
@@ -308,6 +370,119 @@ class AppointmentCompleteView(APIView):
         # Queue layer reacts to completion (independent of booking/scheduling).
         from queues.services import QueueService
 
+        QueueService.recalculate_queue(appointment.doctor, appointment.date)
+
+        return Response(AppointmentSerializer(appointment).data)
+
+
+class AppointmentRescheduleView(APIView):
+    """POST /api/appointments/{id}/reschedule/  {date, time, doctor?,
+    visit_type?, estimated_duration?, reason?}
+
+    A true reschedule: moves the SAME Appointment row to a new slot instead
+    of cancelling and creating a new one, so its history, any Billing
+    invoice/payment linked to it, and its AppointmentDurationPrediction
+    snapshot all stay attached exactly as they are — nothing here ever
+    creates a new Appointment or a new prediction row.
+
+    Reuses the existing dual-layer validation: AppointmentSerializer.validate()
+    for a friendly error first (now exclude_id-aware so the appointment's own
+    current slot never counts as a conflict with itself), then
+    BookingService.reschedule() for the airtight, lock-protected check and
+    the actual persistence — the same pattern every other booking call site
+    already uses. Frees the vacated old slot through the existing Smart
+    Waitlist auto-fill (only when the slot actually changed) and
+    recalculates the queue for both the old and new day, mirroring
+    AppointmentCancelView/AppointmentCompleteView's existing side-effect
+    pattern. Gated on "appointment.reschedule" — a permission code already
+    seeded in RBAC (granted to Doctor/Receptionist/Admin/Owner) but unused
+    until now."""
+
+    permission_classes = [PermissionRequired]
+    permission_code = "appointment.reschedule"
+
+    def post(self, request, pk):
+        appointment = get_object_or_404(
+            Appointment.objects.select_related("doctor"), pk=pk
+        )
+        if appointment.status not in Appointment.ACTIVE_STATUSES:
+            return Response(
+                {"detail": "Only active appointments can be rescheduled."},
+                status=400,
+            )
+        if appointment.consultation_started_at is not None:
+            return Response(
+                {
+                    "detail": "This consultation has already started and "
+                    "cannot be rescheduled."
+                },
+                status=400,
+            )
+
+        data = {
+            "doctor": request.data.get("doctor", appointment.doctor_id),
+            "date": request.data.get("date"),
+            "time": request.data.get("time"),
+            "visit_type": request.data.get("visit_type", appointment.visit_type_id),
+            "estimated_duration": request.data.get(
+                "estimated_duration", appointment.estimated_duration
+            ),
+            "reason": request.data.get("reason", appointment.reason),
+        }
+        serializer = AppointmentSerializer(
+            data=data,
+            context={"request": request, "exclude_id": appointment.id},
+        )
+        try:
+            serializer.is_valid(raise_exception=True)
+        except DRFValidationError as exc:
+            if _conflict_codes(exc):
+                return Response(SLOT_TAKEN, status=status.HTTP_409_CONFLICT)
+            raise
+
+        old_doctor = appointment.doctor
+        old_date = appointment.date
+        old_time = appointment.time
+        old_duration = appointment.estimated_duration or 30
+
+        try:
+            appointment = BookingService.reschedule(
+                appointment,
+                doctor=serializer.validated_data["doctor"],
+                date=serializer.validated_data["date"],
+                time=serializer.validated_data["time"],
+                estimated_duration=serializer.validated_data.get("estimated_duration"),
+                visit_type=serializer.validated_data.get("visit_type"),
+                reason=serializer.validated_data.get("reason"),
+            )
+        except BookingConflict:
+            return Response(SLOT_TAKEN, status=status.HTTP_409_CONFLICT)
+
+        track(
+            "appointment_rescheduled",
+            appointment=appointment.id,
+            from_date=str(old_date),
+            from_time=str(old_time),
+            to_date=str(appointment.date),
+            to_time=str(appointment.time),
+        )
+
+        moved = (
+            old_doctor.id != appointment.doctor_id
+            or old_date != appointment.date
+            or old_time != appointment.time
+        )
+        if moved:
+            # Only offer the vacated slot if it is actually vacated — a
+            # no-op reschedule (identical doctor/date/time) leaves this
+            # appointment still sitting in it, and auto_fill_slot trusts the
+            # caller rather than re-checking that itself.
+            auto_fill_slot(old_doctor, old_date, old_time, old_duration)
+
+        # Queue layer reacts on both affected days (independent of booking).
+        from queues.services import QueueService
+
+        QueueService.recalculate_queue(old_doctor, old_date)
         QueueService.recalculate_queue(appointment.doctor, appointment.date)
 
         return Response(AppointmentSerializer(appointment).data)

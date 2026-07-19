@@ -4,7 +4,7 @@ attendance, waitlist, and EMR logic.
 """
 
 from datetime import timedelta
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 
 from django.db.models import Avg, Q, Sum
 from django.http import HttpResponse
@@ -131,10 +131,25 @@ class AddItemView(APIView):
     def post(self, request, pk):
         invoice = get_object_or_404(Invoice, pk=pk)
         service_id = request.data.get("service")
-        quantity = int(request.data.get("quantity", 1) or 1)
+        # quantity/unit_price/discount/tax_percentage/service all arrive as
+        # untrusted request.data values; int()/Decimal() conversions further
+        # down (here and in BillingService) raise ValueError/TypeError/
+        # decimal.InvalidOperation on malformed input, which previously went
+        # uncaught and surfaced as a raw 500 instead of a 400/404.
+        try:
+            quantity = int(request.data.get("quantity", 1) or 1)
+        except (TypeError, ValueError):
+            return Response(
+                {"detail": "quantity must be a whole number."}, status=400
+            )
         try:
             if service_id:
-                service = get_object_or_404(MedicalService, pk=service_id, active=True)
+                try:
+                    service = MedicalService.objects.get(pk=service_id, active=True)
+                except (MedicalService.DoesNotExist, ValueError, TypeError):
+                    return Response(
+                        {"detail": "Invalid or unknown service."}, status=404
+                    )
                 BillingService.add_service(invoice, service, quantity=quantity)
             else:
                 description = request.data.get("description")
@@ -152,6 +167,14 @@ class AddItemView(APIView):
                 )
         except BillingError as e:
             return Response({"detail": str(e)}, status=400)
+        except (InvalidOperation, TypeError, ValueError):
+            return Response(
+                {
+                    "detail": "unit_price, discount, and tax_percentage must be "
+                    "valid numbers."
+                },
+                status=400,
+            )
         invoice.refresh_from_db()
         return Response(_serialize(invoice, request), status=status.HTTP_201_CREATED)
 
@@ -180,6 +203,11 @@ class RecordPaymentView(APIView):
             )
         except BillingError as e:
             return Response({"detail": str(e)}, status=400)
+        except (InvalidOperation, TypeError, ValueError):
+            # amount is untrusted request.data; a malformed value (e.g. a
+            # non-numeric string) previously raised decimal.InvalidOperation
+            # uncaught, surfacing as a 500 instead of a validation error.
+            return Response({"detail": "amount must be a valid number."}, status=400)
         invoice.refresh_from_db()
         return Response(
             {
@@ -224,6 +252,9 @@ class RefundView(APIView):
             )
         except BillingError as e:
             return Response({"detail": str(e)}, status=400)
+        except (InvalidOperation, TypeError, ValueError):
+            # Same untrusted-amount conversion issue as RecordPaymentView.
+            return Response({"detail": "amount must be a valid number."}, status=400)
         invoice.refresh_from_db()
         return Response(
             {

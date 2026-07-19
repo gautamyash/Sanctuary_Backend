@@ -41,6 +41,20 @@ class NotificationService:
             appointment.time,
         )
 
+    @staticmethod
+    def send_appointment_cancelled_leave(appointment):
+        """Distinct from a normal patient-initiated cancel (which sends no
+        notification at all) — this one exists because the patient didn't
+        take the cancelling action themselves and needs to know why."""
+        logger.info(
+            "[PUSH] %s, your appointment with %s on %s at %s has been "
+            "cancelled because the doctor is on approved leave.",
+            appointment.patient.email,
+            appointment.doctor.name,
+            appointment.date,
+            appointment.time,
+        )
+
     # --- Real-Time Queue Optimization (Feature 3) -------------------------
     # Log-only today; swap bodies for Expo Push later. Business logic never
     # depends on these returning anything.

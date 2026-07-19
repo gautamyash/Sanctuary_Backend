@@ -4,7 +4,7 @@ from rest_framework import serializers
 
 from doctors.serializers import DoctorSerializer
 from .models import Appointment, VisitType, WaitlistEntry
-from .services import find_overlap, within_working_hours
+from .services import find_overlap, is_doctor_on_leave, within_working_hours
 
 
 def _time_label(value):
@@ -115,6 +115,26 @@ class AppointmentSerializer(serializers.ModelSerializer):
         )
         attrs["estimated_duration"] = duration
 
+        # Phase: Advanced Doctor Schedule & Leave Management — an approved
+        # DoctorLeave blocks booking, checked before the working-hours/
+        # overlap checks below. Uses a distinct field ("date") and error
+        # code ("leave") so _conflict_codes() in appointments/views.py does
+        # NOT treat this as a 409 race-condition conflict (it only matches
+        # "unique" on non_field_errors or "overlap" on "time") — this is a
+        # genuine 400 validation error, not a slot race.
+        # exclude_id (Phase: Appointment Rescheduling) — set only by
+        # AppointmentRescheduleView's context, so the appointment being
+        # moved never registers as an overlap with its own current slot.
+        # Every other caller never sets this context key, so find_overlap
+        # behaves exactly as before for them.
+        exclude_id = self.context.get("exclude_id")
+
+        if is_doctor_on_leave(doctor, day):
+            raise serializers.ValidationError(
+                {"date": "The doctor is on approved leave on this date."},
+                code="leave",
+            )
+
         if not within_working_hours(doctor, day, slot, duration):
             raise serializers.ValidationError(
                 {
@@ -123,7 +143,7 @@ class AppointmentSerializer(serializers.ModelSerializer):
                 }
             )
 
-        if find_overlap(doctor, day, slot, duration):
+        if find_overlap(doctor, day, slot, duration, exclude_id=exclude_id):
             raise serializers.ValidationError(
                 {"time": "This time overlaps another appointment."},
                 code="overlap",

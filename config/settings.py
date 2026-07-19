@@ -38,6 +38,16 @@ if not DEBUG and (not ALLOWED_HOSTS or "*" in ALLOWED_HOSTS):
         'environment when DEBUG=False ("*" is not permitted).'
     )
 
+# Cookie hardening (Django's own "check --deploy" checklist flags both of
+# these). Only takes effect once DEBUG=False, so local/dev over plain HTTP
+# is completely unaffected — same conditional pattern as the SECRET_KEY/
+# ALLOWED_HOSTS guards above. Not paired with SECURE_SSL_REDIRECT/HSTS here
+# since those depend on the deployment's TLS-termination topology (e.g. a
+# reverse proxy) and risk redirect loops if enabled blindly.
+if not DEBUG:
+    SESSION_COOKIE_SECURE = True
+    CSRF_COOKIE_SECURE = True
+
 INSTALLED_APPS = [
     "django.contrib.admin",
     "django.contrib.auth",
@@ -145,6 +155,15 @@ REST_FRAMEWORK = {
     ),
     "DEFAULT_PAGINATION_CLASS": "rest_framework.pagination.PageNumberPagination",
     "PAGE_SIZE": 20,
+    # Scoped throttles for specific public endpoints only (see accounts/views.py)
+    # — no DEFAULT_THROTTLE_CLASSES is set globally, so every other endpoint's
+    # behavior is completely unaffected.
+    "DEFAULT_THROTTLE_RATES": {
+        "login": "30/min",
+        "password_reset_request": "5/min",
+        "password_reset_confirm": "5/min",
+        "register": "10/min",
+    },
 }
 
 SIMPLE_JWT = {
