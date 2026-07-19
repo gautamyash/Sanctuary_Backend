@@ -10,6 +10,7 @@ from django.db.models import Avg, Q, Sum
 from django.http import HttpResponse
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
+from django.utils.dateparse import parse_date
 from rest_framework import status
 from rest_framework.response import Response
 from rest_framework.views import APIView
@@ -69,11 +70,30 @@ class AdminInvoiceListView(APIView):
         if p.get("payment_status"):
             qs = qs.filter(payment_status=p["payment_status"])
         if p.get("patient"):
-            qs = qs.filter(patient_id=p["patient"])
+            # Production hardening: these are untrusted query params used
+            # directly in filters below — a non-numeric patient id or an
+            # unparseable date raises an uncaught ValueError/ValidationError
+            # once the queryset is evaluated (DRF's exception handler doesn't
+            # translate either), which previously surfaced as a raw 500.
+            try:
+                patient_id = int(p["patient"])
+            except (TypeError, ValueError):
+                return Response({"detail": "patient must be a valid id."}, status=400)
+            qs = qs.filter(patient_id=patient_id)
         if p.get("date_from"):
-            qs = qs.filter(issued_at__date__gte=p["date_from"])
+            parsed_from = parse_date(p["date_from"])
+            if parsed_from is None:
+                return Response(
+                    {"detail": "date_from must be in YYYY-MM-DD format."}, status=400
+                )
+            qs = qs.filter(issued_at__date__gte=parsed_from)
         if p.get("date_to"):
-            qs = qs.filter(issued_at__date__lte=p["date_to"])
+            parsed_to = parse_date(p["date_to"])
+            if parsed_to is None:
+                return Response(
+                    {"detail": "date_to must be in YYYY-MM-DD format."}, status=400
+                )
+            qs = qs.filter(issued_at__date__lte=parsed_to)
         if p.get("q"):
             term = p["q"]
             qs = qs.filter(

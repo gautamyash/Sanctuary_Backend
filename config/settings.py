@@ -163,6 +163,11 @@ REST_FRAMEWORK = {
         "password_reset_request": "5/min",
         "password_reset_confirm": "5/min",
         "register": "10/min",
+        "token_refresh": "60/min",
+        "appointment_booking": "20/min",
+        "appointment_booking_admin": "60/min",
+        "appointment_reschedule": "20/min",
+        "waitlist_join": "10/min",
     },
 }
 

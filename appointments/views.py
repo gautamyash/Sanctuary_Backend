@@ -3,12 +3,15 @@ from datetime import datetime, timedelta
 from django.contrib.auth import get_user_model
 from django.db import transaction
 from django.db.models import Avg, Count, Q
+from django.http import Http404
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
+from django.utils.dateparse import parse_date
 from rest_framework import generics, permissions, status
 from rest_framework.exceptions import ValidationError as DRFValidationError
 from rest_framework.pagination import PageNumberPagination
 from rest_framework.response import Response
+from rest_framework.throttling import ScopedRateThrottle
 from rest_framework.views import APIView
 
 from authorization.permissions import PermissionRequired
@@ -32,6 +35,7 @@ from .services import (
     BookingConflict,
     BookingService,
     auto_fill_slot,
+    doctor_scope_denied,
     expire_stale_offers,
 )
 
@@ -49,6 +53,19 @@ def _conflict_codes(exc: DRFValidationError) -> bool:
     return "overlap" in codes.get("time", [])
 
 
+def _get_object_or_404_safe(klass, **kwargs):
+    """get_object_or_404, but also 404s on a malformed (non-numeric) pk
+    (Production hardening) instead of letting Django's int() conversion
+    raise an uncaught ValueError — confirmed via this Django version's
+    get_object_or_404, which only catches DoesNotExist, not ValueError/
+    TypeError. Only needed for pks that come from the request body/query
+    params; URL-path pks are already safe via the <int:pk> converter."""
+    try:
+        return get_object_or_404(klass, **kwargs)
+    except (ValueError, TypeError):
+        raise Http404
+
+
 class VisitTypeListView(generics.ListAPIView):
     queryset = VisitType.objects.filter(active=True)
     serializer_class = VisitTypeSerializer
@@ -60,10 +77,10 @@ class PredictDurationView(APIView):
     """POST /api/predictions/duration/  {doctor, visit_type}"""
 
     def post(self, request):
-        doctor = get_object_or_404(
+        doctor = _get_object_or_404_safe(
             Doctor, pk=request.data.get("doctor"), is_active=True
         )
-        visit_type = get_object_or_404(
+        visit_type = _get_object_or_404_safe(
             VisitType, pk=request.data.get("visit_type"), active=True
         )
         track(
@@ -138,6 +155,19 @@ class AdminAppointmentListView(APIView):
         )
         return [PermissionRequired()]
 
+    def get_throttles(self):
+        # Rate-limited (Production hardening) on POST only — this books an
+        # appointment on someone else's behalf, the same class of action as
+        # the patient-facing booking endpoint, so it gets the same style of
+        # cap. GET (the admin appointments list/search table) is untouched:
+        # scoping the throttle to POST via get_throttles() rather than a
+        # class-wide throttle_classes avoids rate-limiting normal list
+        # browsing/searching.
+        if self.request.method == "POST":
+            self.throttle_scope = "appointment_booking_admin"
+            return [ScopedRateThrottle()]
+        return []
+
     def get(self, request):
         qs = Appointment.objects.select_related(
             "doctor", "doctor__specialty", "visit_type", "patient"
@@ -145,16 +175,44 @@ class AdminAppointmentListView(APIView):
         p = request.query_params
         if p.get("status"):
             qs = qs.filter(status=p["status"])
+        # Production hardening: doctor/patient are FK ids and date/date_from/
+        # date_to are DateFields — Django's ORM raises a bare ValueError (ids)
+        # or django.core.exceptions.ValidationError (dates) once the queryset
+        # is evaluated, and DRF's exception handler only translates Http404/
+        # PermissionDenied, so either would otherwise surface as an uncaught
+        # 500 for a malformed query param. Converting/parsing up front, before
+        # the value ever reaches the ORM, keeps this a clean 400.
         if p.get("doctor"):
-            qs = qs.filter(doctor_id=p["doctor"])
+            try:
+                qs = qs.filter(doctor_id=int(p["doctor"]))
+            except (TypeError, ValueError):
+                return Response({"detail": "doctor must be a valid id."}, status=400)
         if p.get("patient"):
-            qs = qs.filter(patient_id=p["patient"])
+            try:
+                qs = qs.filter(patient_id=int(p["patient"]))
+            except (TypeError, ValueError):
+                return Response({"detail": "patient must be a valid id."}, status=400)
         if p.get("date"):
-            qs = qs.filter(date=p["date"])
+            parsed = parse_date(p["date"])
+            if parsed is None:
+                return Response(
+                    {"detail": "date must be in YYYY-MM-DD format."}, status=400
+                )
+            qs = qs.filter(date=parsed)
         if p.get("date_from"):
-            qs = qs.filter(date__gte=p["date_from"])
+            parsed = parse_date(p["date_from"])
+            if parsed is None:
+                return Response(
+                    {"detail": "date_from must be in YYYY-MM-DD format."}, status=400
+                )
+            qs = qs.filter(date__gte=parsed)
         if p.get("date_to"):
-            qs = qs.filter(date__lte=p["date_to"])
+            parsed = parse_date(p["date_to"])
+            if parsed is None:
+                return Response(
+                    {"detail": "date_to must be in YYYY-MM-DD format."}, status=400
+                )
+            qs = qs.filter(date__lte=parsed)
         if p.get("q"):
             term = p["q"]
             qs = qs.filter(
@@ -184,7 +242,18 @@ class AdminAppointmentListView(APIView):
         patient_id = request.data.get("patient")
         if not patient_id:
             return Response({"detail": "patient is required."}, status=400)
-        patient = get_object_or_404(User, pk=patient_id)
+        patient = _get_object_or_404_safe(User, pk=patient_id)
+        # Patient Archive hardening: self-service booking and waitlist
+        # accept/join are already blocked for a deactivated account by
+        # SimpleJWT's own CHECK_USER_IS_ACTIVE check (it rejects the token
+        # outright), since those always book as request.user. This is the
+        # one booking path where staff choose the patient explicitly, so it
+        # needs its own explicit check.
+        if not patient.is_active:
+            return Response(
+                {"detail": "This patient's account is inactive and cannot be booked."},
+                status=400,
+            )
 
         serializer = AppointmentSerializer(data=request.data)
         try:
@@ -209,6 +278,14 @@ class AdminAppointmentListView(APIView):
             )
         except BookingConflict:
             return Response(SLOT_TAKEN, status=status.HTTP_409_CONFLICT)
+        # Notification completeness: WaitlistAcceptView already notifies the
+        # patient via this exact call for its own BookingService.book() call
+        # site; the two direct-booking call sites (this one and the
+        # patient-facing AppointmentListCreateView below) never did. This is
+        # staff booking on the patient's behalf, so the patient especially
+        # needs to be told — reusing the same generic, already-existing
+        # message rather than adding a new one.
+        NotificationService.send_slot_confirmed(appointment)
         return Response(
             AdminAppointmentSerializer(appointment, context={"request": request}).data,
             status=status.HTTP_201_CREATED,
@@ -231,6 +308,15 @@ class AppointmentListCreateView(generics.ListCreateAPIView):
         if status_param:
             qs = qs.filter(status=status_param)
         return qs
+
+    def get_throttles(self):
+        # Rate-limited (Production hardening) on POST (booking) only — GET
+        # (a patient's own appointment list) is untouched so normal app
+        # polling/refreshing is never rate-limited.
+        if self.request.method == "POST":
+            self.throttle_scope = "appointment_booking"
+            return [ScopedRateThrottle()]
+        return []
 
     def create(self, request, *args, **kwargs):
         serializer = self.get_serializer(data=request.data)
@@ -256,6 +342,10 @@ class AppointmentListCreateView(generics.ListCreateAPIView):
             )
         except BookingConflict:
             return Response(SLOT_TAKEN, status=status.HTTP_409_CONFLICT)
+        # Notification completeness: same reasoning as AdminAppointmentListView.post()
+        # below it and WaitlistAcceptView above — every BookingService.book()
+        # call site should notify the patient consistently.
+        NotificationService.send_slot_confirmed(appointment)
         if source == "manual":
             track(
                 "doctor_override_duration",
@@ -314,6 +404,11 @@ class AppointmentCompleteView(APIView):
             appointment = Appointment.objects.get(pk=pk)
         except Appointment.DoesNotExist:
             return Response({"detail": "Not found."}, status=404)
+        if doctor_scope_denied(request.user, appointment):
+            return Response(
+                {"detail": "You can only complete your own appointments."},
+                status=403,
+            )
         if appointment.status not in Appointment.ACTIVE_STATUSES:
             return Response(
                 {"detail": "Only active appointments can be completed."},
@@ -335,36 +430,42 @@ class AppointmentCompleteView(APIView):
         )
         actual = actual or appointment.estimated_duration or 30
 
-        appointment.status = Appointment.Status.COMPLETED
-        appointment.actual_duration = actual
-        appointment.consultation_started_at = (
-            appointment.consultation_started_at or started
-        )
-        appointment.consultation_completed_at = (
-            appointment.consultation_started_at + timedelta(minutes=actual)
-        )
-        appointment.save(
-            update_fields=[
-                "status",
-                "actual_duration",
-                "consultation_started_at",
-                "consultation_completed_at",
-                "updated_at",
-            ]
-        )
-
-        prediction = getattr(appointment, "duration_prediction", None)
-        if prediction:
-            prediction.actual_minutes = actual
-            prediction.save(update_fields=["actual_minutes"])
-            error = abs(prediction.predicted_minutes - actual)
-            track(
-                "prediction_accuracy",
-                appointment=appointment.id,
-                predicted=prediction.predicted_minutes,
-                actual=actual,
-                error_minutes=error,
+        # Production hardening: this touches two models (Appointment and, when
+        # a duration prediction exists, AppointmentDurationPrediction) as one
+        # logical "complete this consultation" operation — previously not
+        # atomic, so a failure between the two saves could leave the
+        # appointment marked completed without its prediction reconciled.
+        with transaction.atomic():
+            appointment.status = Appointment.Status.COMPLETED
+            appointment.actual_duration = actual
+            appointment.consultation_started_at = (
+                appointment.consultation_started_at or started
             )
+            appointment.consultation_completed_at = (
+                appointment.consultation_started_at + timedelta(minutes=actual)
+            )
+            appointment.save(
+                update_fields=[
+                    "status",
+                    "actual_duration",
+                    "consultation_started_at",
+                    "consultation_completed_at",
+                    "updated_at",
+                ]
+            )
+
+            prediction = getattr(appointment, "duration_prediction", None)
+            if prediction:
+                prediction.actual_minutes = actual
+                prediction.save(update_fields=["actual_minutes"])
+                error = abs(prediction.predicted_minutes - actual)
+                track(
+                    "prediction_accuracy",
+                    appointment=appointment.id,
+                    predicted=prediction.predicted_minutes,
+                    actual=actual,
+                    error_minutes=error,
+                )
         track("consultation_completed", appointment=appointment.id, actual=actual)
 
         # Queue layer reacts to completion (independent of booking/scheduling).
@@ -400,11 +501,24 @@ class AppointmentRescheduleView(APIView):
 
     permission_classes = [PermissionRequired]
     permission_code = "appointment.reschedule"
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = "appointment_reschedule"
 
     def post(self, request, pk):
         appointment = get_object_or_404(
             Appointment.objects.select_related("doctor"), pk=pk
         )
+        # Object ownership (Production hardening): "appointment.reschedule" is
+        # granted to Doctor too, same as "appointment.edit" on
+        # AppointmentCompleteView — without this check, one doctor could
+        # reschedule another doctor's appointment. Reuses the exact same
+        # doctor_scope_denied() helper; Receptionist/Admin/Owner are
+        # unaffected (it always returns False for them).
+        if doctor_scope_denied(request.user, appointment):
+            return Response(
+                {"detail": "You can only reschedule your own appointments."},
+                status=403,
+            )
         if appointment.status not in Appointment.ACTIVE_STATUSES:
             return Response(
                 {"detail": "Only active appointments can be rescheduled."},
@@ -457,6 +571,15 @@ class AppointmentRescheduleView(APIView):
             )
         except BookingConflict:
             return Response(SLOT_TAKEN, status=status.HTTP_409_CONFLICT)
+
+        # Notification completeness: unlike a patient-initiated cancel (no
+        # notification, documented on send_appointment_cancelled_leave — the
+        # patient already knows because they did it), a reschedule here is
+        # always staff-initiated ("appointment.reschedule" is not granted for
+        # patient self-service), so the patient genuinely needs to be told
+        # their slot moved. Reuses the same generic confirmation message
+        # every other successful booking/reschedule now sends.
+        NotificationService.send_slot_confirmed(appointment)
 
         track(
             "appointment_rescheduled",
@@ -535,6 +658,14 @@ class WaitlistListCreateView(generics.ListCreateAPIView):
     """
 
     serializer_class = WaitlistEntrySerializer
+
+    def get_throttles(self):
+        # Rate-limited (Production hardening) on POST (join) only — GET (a
+        # patient's own waitlist entries) is untouched.
+        if self.request.method == "POST":
+            self.throttle_scope = "waitlist_join"
+            return [ScopedRateThrottle()]
+        return []
 
     def get_queryset(self):
         # Lazy sweep so expired offers cascade even without the cron job.

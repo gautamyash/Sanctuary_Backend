@@ -8,7 +8,7 @@ from rest_framework.response import Response
 from rest_framework.throttling import ScopedRateThrottle
 from rest_framework.views import APIView
 from rest_framework_simplejwt.tokens import RefreshToken
-from rest_framework_simplejwt.views import TokenObtainPairView
+from rest_framework_simplejwt.views import TokenObtainPairView, TokenRefreshView
 
 from .serializers import (
     PasswordResetConfirmSerializer,
@@ -34,6 +34,16 @@ class ThrottledTokenObtainPairView(TokenObtainPairView):
 
     throttle_classes = [ScopedRateThrottle]
     throttle_scope = "login"
+
+
+class ThrottledTokenRefreshView(TokenRefreshView):
+    """POST /api/auth/token/refresh/ — identical to simplejwt's stock
+    TokenRefreshView; adds only a per-client rate limit (Production
+    hardening) alongside the login endpoint's, since a refresh token is
+    also a credential worth capping brute-force/abuse attempts against."""
+
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = "token_refresh"
 
 
 class RegisterView(generics.CreateAPIView):

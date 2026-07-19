@@ -10,6 +10,7 @@ These react to appointment outcomes without touching booking/scheduling:
     double-offers a slot the existing cancel flow already handled.
 """
 
+from django.db import transaction
 from django.utils import timezone
 
 from appointments.analytics import track
@@ -103,18 +104,29 @@ def maybe_backfill_waitlist(appointment) -> WaitlistEntry | None:
 def mark_no_show(appointment) -> None:
     """Mark an appointment as a no-show: reconcile accuracy, notify, log, and
     backfill the freed slot from the waitlist if it was high risk."""
-    # Reconcile BEFORE mutating so the prediction still reflects pre-no-show
-    # risk.
-    record_outcome(appointment, "no_show")
+    # Production hardening: reconciling the prediction, flipping
+    # attendance_status, and logging the follow-up reminder are three model
+    # writes (AppointmentRiskPrediction, Appointment, ReminderLog) that make up
+    # one logical "mark as no-show" operation — previously not atomic, so a
+    # failure partway through could leave the appointment marked no-show
+    # without its reminder log, or vice versa. The notification (log-only, no
+    # DB write) and the waitlist backfill (its own existing atomic scope via
+    # auto_fill_slot) stay outside, matching how every other lifecycle
+    # endpoint in this codebase keeps side effects after the core write.
+    with transaction.atomic():
+        # Reconcile BEFORE mutating so the prediction still reflects
+        # pre-no-show risk.
+        record_outcome(appointment, "no_show")
 
-    appointment.attendance_status = Appointment.Attendance.NO_SHOW
-    appointment.save(update_fields=["attendance_status", "updated_at"])
+        appointment.attendance_status = Appointment.Attendance.NO_SHOW
+        appointment.save(update_fields=["attendance_status", "updated_at"])
+
+        ReminderLog.objects.create(
+            appointment=appointment, type=ReminderLog.Type.FOLLOWUP
+        )
 
     track("no_show_detected", appointment=appointment.id)
     NotificationService.send_no_show_followup(appointment)
-    ReminderLog.objects.create(
-        appointment=appointment, type=ReminderLog.Type.FOLLOWUP
-    )
     maybe_backfill_waitlist(appointment)
 
 

@@ -17,6 +17,7 @@ from rest_framework.views import APIView
 from appointments.analytics import track
 from appointments.models import Appointment
 from appointments.notifications import NotificationService
+from appointments.services import doctor_scope_denied
 from authorization.permissions import PermissionRequired
 from authorization.services import PermissionService
 from doctors.models import Doctor, DoctorSchedule
@@ -84,6 +85,10 @@ class ConsultationStartView(APIView):
         appointment = get_object_or_404(
             Appointment.objects.select_related("doctor"), pk=pk
         )
+        if doctor_scope_denied(request.user, appointment):
+            return Response(
+                {"detail": "You can only start your own appointments."}, status=403
+            )
         if appointment.status not in Appointment.ACTIVE_STATUSES:
             return Response(
                 {"detail": "Only active appointments can be started."}, status=400
@@ -91,6 +96,15 @@ class ConsultationStartView(APIView):
         if appointment.consultation_started_at is not None:
             return Response(
                 {"detail": "This consultation has already started."}, status=400
+            )
+        if appointment.attendance_status == Appointment.Attendance.NO_SHOW:
+            # Production hardening: a no-show doesn't change `status` (it's
+            # tracked separately via attendance_status), so the ACTIVE_STATUSES
+            # check above doesn't catch it — without this, a consultation
+            # already marked no-show could still be "started".
+            return Response(
+                {"detail": "This appointment was marked as a no-show and cannot be started."},
+                status=400,
             )
 
         appointment.consultation_started_at = timezone.now()
@@ -124,6 +138,11 @@ class AppointmentNoShowView(APIView):
         appointment = get_object_or_404(
             Appointment.objects.select_related("doctor"), pk=pk
         )
+        if doctor_scope_denied(request.user, appointment):
+            return Response(
+                {"detail": "You can only mark your own appointments as a no-show."},
+                status=403,
+            )
         if appointment.status not in Appointment.ACTIVE_STATUSES:
             return Response(
                 {"detail": "Only active appointments can be marked as a no-show."},
@@ -210,6 +229,15 @@ class QueueAnalyticsView(APIView):
         )
         doctor_id = request.query_params.get("doctor")
         if doctor_id:
+            # Production hardening: doctor_id is an untrusted query param used
+            # directly in an FK filter below — a non-numeric value raises a
+            # bare ValueError once the queryset is evaluated, which DRF's
+            # exception handler does not translate, so it would otherwise be
+            # an uncaught 500.
+            try:
+                doctor_id = int(doctor_id)
+            except (TypeError, ValueError):
+                return Response({"detail": "doctor must be a valid id."}, status=400)
             appts = appts.filter(doctor_id=doctor_id)
 
         completed = list(

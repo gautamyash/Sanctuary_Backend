@@ -370,6 +370,24 @@ def handle_leave_conflicts(leave) -> list:
     return conflicts
 
 
+def doctor_scope_denied(user, appointment) -> bool:
+    """True if `user` holds a Doctor account (a linked Doctor profile) and
+    that profile is not the one assigned to `appointment` — i.e. a doctor
+    reaching for another doctor's appointment via the live-queue actions
+    (start consultation / complete / mark no-show).
+
+    Reuses the exact same ownership signal doctors/me_views.py and
+    IsLinkedDoctor already use (`user.doctor_profile`) rather than checking
+    role names directly — a user only has this attribute set at all if
+    their account is provisioned as a Doctor (see
+    authorization/profile_provisioning.py), so Admin/Owner/Receptionist/
+    Nurse accounts have no `doctor_profile` and this is always False for
+    them, leaving their existing (broader) access on these endpoints
+    completely unchanged."""
+    doctor_profile = getattr(user, "doctor_profile", None)
+    return doctor_profile is not None and doctor_profile.id != appointment.doctor_id
+
+
 def active_intervals(doctor, day, exclude_id=None):
     """The busy [start_dt, end_dt) intervals of a doctor's active
     (confirmed/pending) appointments on `day`, each paired with its

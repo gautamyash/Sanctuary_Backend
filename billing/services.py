@@ -6,6 +6,7 @@ creation and payment recording run in transactions. The engine reacts to
 appointment/EMR events but never controls them.
 """
 
+from datetime import timedelta
 from decimal import Decimal, ROUND_HALF_UP
 
 from django.db import transaction
@@ -18,6 +19,12 @@ from .models import Coupon, Invoice, InvoiceItem, Payment, Refund
 
 TWO = Decimal("0.01")
 ZERO = Decimal("0.00")
+
+# Production hardening: repeated-request window for double-submit protection
+# on payments/refunds (e.g. a double-click or a client retry after a slow
+# response). A second identical request inside this window is treated as the
+# same operation and returns the existing row instead of creating a duplicate.
+DUPLICATE_SUBMIT_WINDOW = timedelta(seconds=10)
 
 
 class BillingError(Exception):
@@ -64,6 +71,7 @@ class BillingService:
         return invoice
 
     @staticmethod
+    @transaction.atomic
     def add_item(invoice, description, unit_price, quantity=1, discount=ZERO,
                  tax_percentage=ZERO, service=None) -> InvoiceItem:
         qty = int(quantity)
@@ -101,6 +109,7 @@ class BillingService:
         )
 
     @staticmethod
+    @transaction.atomic
     def remove_item(invoice, item_id) -> None:
         InvoiceItem.objects.filter(invoice=invoice, pk=item_id).delete()
         BillingService.calculate_totals(invoice)
@@ -180,6 +189,7 @@ class BillingService:
     # Coupons, payments, refunds
     # ------------------------------------------------------------------ #
     @staticmethod
+    @transaction.atomic
     def apply_coupon(invoice, code: str) -> Invoice:
         try:
             coupon = Coupon.objects.get(code__iexact=code, active=True)
@@ -208,6 +218,25 @@ class BillingService:
         if amount <= ZERO:
             raise BillingError("Payment amount must be positive.")
         locked = Invoice.objects.select_for_update().get(pk=invoice.pk)
+
+        # Prevent double form submissions: an identical payment (same
+        # invoice/method/amount/reference) recorded moments ago is treated as
+        # the same request, not a new one — reuses the existing row instead
+        # of creating a duplicate charge.
+        duplicate = (
+            locked.payments.filter(
+                method=method,
+                amount=amount,
+                reference=reference or "",
+                status=Payment.Status.SUCCESS,
+                paid_at__gte=timezone.now() - DUPLICATE_SUBMIT_WINDOW,
+            )
+            .order_by("-paid_at")
+            .first()
+        )
+        if duplicate is not None:
+            return duplicate
+
         payment = Payment.objects.create(
             invoice=locked,
             method=method,
@@ -236,8 +265,30 @@ class BillingService:
         amount = money(amount)
         if amount <= ZERO:
             raise BillingError("Refund amount must be positive.")
-        # Refresh so amount_paid reflects any payments recorded on a locked copy.
-        invoice.refresh_from_db()
+        # Production hardening: lock the invoice row the same way
+        # record_payment() already does — without it, two concurrent refund
+        # requests on the same invoice could both read the same
+        # amount_paid/refund history before either commits, and both pass the
+        # "does not exceed amount paid" check below, over-refunding the
+        # invoice. This reuses the exact same select_for_update() pattern
+        # already established for payments; no new locking strategy.
+        invoice = Invoice.objects.select_for_update().get(pk=invoice.pk)
+
+        # Prevent double form submissions: an identical refund (same
+        # invoice/amount/reason) processed moments ago is treated as the same
+        # request, not a new one.
+        duplicate = (
+            invoice.refunds.filter(
+                amount=amount,
+                reason=reason or "",
+                processed_at__gte=timezone.now() - DUPLICATE_SUBMIT_WINDOW,
+            )
+            .order_by("-processed_at")
+            .first()
+        )
+        if duplicate is not None:
+            return duplicate
+
         if amount > invoice.amount_paid:
             raise BillingError("Refund exceeds the amount paid.")
         refund = Refund.objects.create(

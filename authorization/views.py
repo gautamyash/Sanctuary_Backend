@@ -122,6 +122,26 @@ class UserListView(APIView):
     now also filters to users holding that RBAC role (e.g. ?role=Patient),
     via the existing UserRole/Role join — no new field or model. Omitting
     the param preserves the exact prior response for every existing caller.
+
+    Search hardening (Phase: Patient Search & Merge Hardening) — same ?q=
+    param, same Q-filter chain, no new query param or endpoint:
+      - `q` now also matches `phone` (previously name/email only).
+      - `q` is stripped of leading/trailing whitespace before filtering, so
+        e.g. "  jane " matches the same rows "jane" does instead of
+        (accidentally) requiring a literal space in the field.
+      - Email matching was already case-insensitive — `icontains` compiles
+        to `ILIKE`/`UPPER()`-wrapped `LIKE` regardless of backend — this is
+        unchanged, just confirmed.
+      - `.distinct()` is now applied unconditionally (previously only when
+        `?role=` was also given) so a caller combining `q` with any current
+        or future join-based filter can never see the same user twice.
+
+    Additive (Phase: Patient Archive hardening): `?is_active=true`/`false`
+    filters the listing to active-only or inactive-only accounts, the same
+    query-param style as `?role=`. Omitting it preserves the exact prior
+    response (both active and inactive users listed together) for every
+    existing caller — this endpoint never hid inactive accounts, so nothing
+    changes by default; this only adds the ability to filter when asked.
     """
 
     def get_permissions(self):
@@ -132,13 +152,18 @@ class UserListView(APIView):
 
     def get(self, request):
         qs = User.objects.all().order_by("name")
-        q = request.query_params.get("q")
+        q = (request.query_params.get("q") or "").strip()
         if q:
-            qs = qs.filter(Q(name__icontains=q) | Q(email__icontains=q))
+            qs = qs.filter(
+                Q(name__icontains=q) | Q(email__icontains=q) | Q(phone__icontains=q)
+            )
         role_name = request.query_params.get("role")
         if role_name:
-            qs = qs.filter(user_roles__role__name__iexact=role_name).distinct()
-        return Response({"results": UserSerializer(qs, many=True).data})
+            qs = qs.filter(user_roles__role__name__iexact=role_name)
+        is_active_param = request.query_params.get("is_active")
+        if is_active_param is not None:
+            qs = qs.filter(is_active=is_active_param.strip().lower() in ("1", "true", "yes"))
+        return Response({"results": UserSerializer(qs.distinct(), many=True).data})
 
     def post(self, request):
         serializer = AdminCreateUserSerializer(

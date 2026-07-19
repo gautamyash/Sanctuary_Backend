@@ -55,6 +55,16 @@ class ConfirmAttendanceView(APIView):
                 {"detail": "Only upcoming appointments can be confirmed."},
                 status=400,
             )
+        if appointment.attendance_status == Appointment.Attendance.NO_SHOW:
+            # Production hardening: a no-show doesn't change `status` (it's
+            # tracked separately via attendance_status), so the ACTIVE_STATUSES
+            # check above doesn't catch it — without this, a patient already
+            # marked no-show could still "confirm" attendance, an impossible
+            # backward transition.
+            return Response(
+                {"detail": "This appointment was marked as a no-show and can no longer be confirmed."},
+                status=400,
+            )
 
         appointment.confirmed_at = timezone.now()
         appointment.attendance_status = Appointment.Attendance.CONFIRMED

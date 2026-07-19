@@ -105,6 +105,32 @@ class AdminCreateUserSerializer(serializers.ModelSerializer):
             "date_of_birth": {"required": False},
         }
 
+    def validate(self, attrs):
+        """Duplicate patient prevention (Phase: Duplicate Patient Prevention).
+
+        Scoped to the Patient role only — this endpoint also creates
+        Doctor/Nurse/Staff/etc. accounts, and duplicate-contact checks for
+        those roles are out of scope here. Email is already globally unique
+        (case-sensitive) via the model's `unique=True` and the automatic
+        `UniqueValidator` DRF attaches to it; this adds the case-insensitive
+        comparison the case-sensitive DB constraint can't catch. Phone has no
+        DB-level constraint at all, so it's checked here directly. Blank
+        phone is never treated as a duplicate.
+        """
+        role = attrs.get("role")
+        if role is not None and role.name == "Patient":
+            email = attrs.get("email")
+            if email and User.objects.filter(email__iexact=email).exists():
+                raise serializers.ValidationError(
+                    {"email": "A patient with this email already exists."}
+                )
+            phone = (attrs.get("phone") or "").strip()
+            if phone and User.objects.filter(phone=phone).exists():
+                raise serializers.ValidationError(
+                    {"phone": "A patient with this phone number already exists."}
+                )
+        return attrs
+
     def create(self, validated_data):
         role = validated_data.pop("role")
         password = validated_data.pop("password")
@@ -178,6 +204,37 @@ class AdminUpdateUserSerializer(serializers.ModelSerializer):
             "date_of_birth": {"required": False},
             "is_active": {"required": False},
         }
+
+    def validate(self, attrs):
+        """Duplicate patient prevention (Phase: Duplicate Patient Prevention).
+
+        Email isn't editable through this serializer at all (not in
+        `Meta.fields` — see the class docstring), so it can never collide
+        here; only phone needs a check. Scoped to Patient the same way
+        `AdminCreateUserSerializer` is: uses the instance's current role, or
+        the role being assigned in this same request if one is provided.
+        `.exclude(pk=self.instance.pk)` is what lets a patient keep their own
+        current phone number unchanged.
+        """
+        phone = attrs.get("phone")
+        phone = phone.strip() if phone else phone
+        if phone:
+            role = attrs.get("role") or (
+                Role.objects.filter(user_roles__user=self.instance)
+                .order_by("-priority")
+                .first()
+            )
+            if (
+                role is not None
+                and role.name == "Patient"
+                and User.objects.filter(phone=phone)
+                .exclude(pk=self.instance.pk)
+                .exists()
+            ):
+                raise serializers.ValidationError(
+                    {"phone": "A patient with this phone number already exists."}
+                )
+        return attrs
 
     def update(self, instance, validated_data):
         role = validated_data.pop("role", None)

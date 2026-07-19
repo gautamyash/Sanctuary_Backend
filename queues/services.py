@@ -21,6 +21,7 @@ Estimation model ("anchor to schedule + actual events"):
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
+from django.db import transaction
 from django.utils import timezone
 
 from appointments.analytics import track
@@ -187,23 +188,29 @@ class QueueService:
         saved DoctorQueueState. Safe to call from any lifecycle event."""
         comp = QueueService._compute(doctor, date)
 
-        # Persist queue_position on each appointment (None once completed).
-        for row in comp.rows:
-            new_pos = row.position
-            if row.appointment.queue_position != new_pos:
-                row.appointment.queue_position = new_pos
-                row.appointment.save(update_fields=["queue_position", "updated_at"])
+        # Production hardening: this can write several Appointment rows
+        # (queue_position) plus the DoctorQueueState snapshot as one logical
+        # "rebuild the queue" operation — previously not atomic, so a failure
+        # partway through could leave some appointments' positions updated
+        # against a stale (or missing) snapshot.
+        with transaction.atomic():
+            # Persist queue_position on each appointment (None once completed).
+            for row in comp.rows:
+                new_pos = row.position
+                if row.appointment.queue_position != new_pos:
+                    row.appointment.queue_position = new_pos
+                    row.appointment.save(update_fields=["queue_position", "updated_at"])
 
-        state, _ = DoctorQueueState.objects.update_or_create(
-            doctor=doctor,
-            date=date,
-            defaults={
-                "current_appointment": comp.current,
-                "queue_started_at": comp.queue_started_at,
-                "current_delay_minutes": comp.delay_minutes,
-                "estimated_finish_time": comp.estimated_finish_time,
-            },
-        )
+            state, _ = DoctorQueueState.objects.update_or_create(
+                doctor=doctor,
+                date=date,
+                defaults={
+                    "current_appointment": comp.current,
+                    "queue_started_at": comp.queue_started_at,
+                    "current_delay_minutes": comp.delay_minutes,
+                    "estimated_finish_time": comp.estimated_finish_time,
+                },
+            )
 
         QueueService._notify(comp, state)
         track(

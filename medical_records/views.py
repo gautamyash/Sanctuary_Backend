@@ -6,6 +6,7 @@ attendance, waitlist, and duration-prediction logic.
 from django.contrib.auth import get_user_model
 from django.db.models import Count, Q
 from django.shortcuts import get_object_or_404
+from django.utils.dateparse import parse_date
 from rest_framework import permissions, status
 from rest_framework.parsers import FormParser, MultiPartParser
 from rest_framework.response import Response
@@ -93,7 +94,16 @@ class VisitListView(APIView):
         if p.get("doctor"):
             qs = qs.filter(doctor__name__icontains=p["doctor"])
         if p.get("date"):
-            qs = qs.filter(appointment__date=p["date"])
+            # Production hardening: appointment__date is a DateField — an
+            # unparseable value raises django.core.exceptions.ValidationError
+            # once the queryset is evaluated, which DRF's exception handler
+            # does not translate, so it would otherwise be an uncaught 500.
+            parsed = parse_date(p["date"])
+            if parsed is None:
+                return Response(
+                    {"detail": "date must be in YYYY-MM-DD format."}, status=400
+                )
+            qs = qs.filter(appointment__date=parsed)
         if p.get("q"):
             term = p["q"]
             qs = qs.filter(
@@ -454,6 +464,14 @@ class TimelineView(APIView):
     def get(self, request):
         visit_id = request.query_params.get("visit")
         if visit_id:
+            # Production hardening: pk is an IntegerField — a non-numeric
+            # value raises a bare ValueError once the queryset _visit_for()
+            # builds is evaluated, which DRF's exception handler does not
+            # translate, so it would otherwise be an uncaught 500.
+            try:
+                visit_id = int(visit_id)
+            except (TypeError, ValueError):
+                return Response({"detail": "visit must be a valid id."}, status=400)
             visit = _visit_for(visit_id, request.user, "emr.view")
             if visit is None:
                 return Response({"detail": "Not found."}, status=404)
@@ -534,7 +552,16 @@ class PatientVisitListView(APIView):
         if p.get("doctor"):
             qs = qs.filter(doctor__name__icontains=p["doctor"])
         if p.get("date"):
-            qs = qs.filter(appointment__date=p["date"])
+            # Production hardening: appointment__date is a DateField — an
+            # unparseable value raises django.core.exceptions.ValidationError
+            # once the queryset is evaluated, which DRF's exception handler
+            # does not translate, so it would otherwise be an uncaught 500.
+            parsed = parse_date(p["date"])
+            if parsed is None:
+                return Response(
+                    {"detail": "date must be in YYYY-MM-DD format."}, status=400
+                )
+            qs = qs.filter(appointment__date=parsed)
         if p.get("q"):
             term = p["q"]
             qs = qs.filter(
